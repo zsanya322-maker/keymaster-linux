@@ -1,14 +1,20 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+//! Context tracker: отслеживание активного окна/процесса/виртуального стола.
+//!
+//! Замена WinEventHook из Windows-версии. На KDE Wayland используется
+//! org.kde.KWin.queryWindowInfo (DBus), на X11 — EWMH-опрос. Опрос 250мс:
+//! событий "фокус сменился" на Wayland клиенты не получают.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::thread;
 use tracing::info;
 
 use crate::context::{AppContext, AppContextState};
+use crate::platform;
 
 static GLOBAL_CONTEXT: OnceLock<AppContextState> = OnceLock::new();
 static TRACKER_STARTED: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "windows")]
-static TRACKER_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+static TRACKER_STOP: AtomicBool = AtomicBool::new(false);
 
 pub fn init_context() -> AppContextState {
     if let Some(existing) = GLOBAL_CONTEXT.get() {
@@ -23,265 +29,62 @@ pub fn get_context() -> Option<AppContextState> {
     GLOBAL_CONTEXT.get().cloned()
 }
 
-#[cfg(target_os = "windows")]
-mod win {
-    use super::*;
-    use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, WPARAM};
-    use windows::Win32::Graphics::Gdi::{
-        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+fn refresh_from_x11(context: &AppContextState) -> bool {
+    let Some(active) = platform::x11::active_window() else {
+        return false;
     };
-    use windows::Win32::System::Com::{
-        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-        CoUninitialize,
+    if let Ok(mut state) = context.write() {
+        state.revision = state.revision.wrapping_add(1);
+        state.active_window_id = active.window_id;
+        state.active_process = active.process;
+        state.active_process_path = active.process_path;
+        state.active_window_title = active.title;
+        state.active_window_class = active.class;
+        state.window_width = active.width;
+        state.window_height = active.height;
+        state.fullscreen = active.fullscreen;
+        state.monitor_id = active.monitor_id;
+        state.virtual_desktop_id = active.virtual_desktop;
+    }
+    true
+}
+
+fn refresh_from_kde(context: &AppContextState) -> bool {
+    let Some(active) = platform::kde::active_window() else {
+        return false;
     };
-    use windows::Win32::System::ProcessStatus::K32GetModuleBaseNameW;
-    use windows::Win32::System::Threading::{
-        GetCurrentThreadId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_INFORMATION,
-        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ, QueryFullProcessImageNameW,
-    };
-    use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
-    use windows::Win32::UI::Shell::IVirtualDesktopManager;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, EVENT_SYSTEM_FOREGROUND, GetClassNameW, GetForegroundWindow, GetMessageW,
-        GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, MSG, PM_NOREMOVE, PeekMessageW,
-        PostThreadMessageW, TranslateMessage, WINEVENT_OUTOFCONTEXT, WM_QUIT,
-    };
-    use windows::core::GUID;
-
-    const CLSID_VIRTUAL_DESKTOP_MANAGER: GUID = GUID::from_u128(0xaa5090865ca94c258f95589d3c07b48a);
-
-    fn process_info(hwnd: HWND) -> (String, String) {
-        unsafe {
-            let mut pid = 0u32;
-            GetWindowThreadProcessId(hwnd, Some(&mut pid));
-            if pid == 0 {
-                return (String::new(), String::new());
-            }
-
-            if let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
-                let mut buffer = [0u16; 32768];
-                let mut size = buffer.len() as u32;
-                if QueryFullProcessImageNameW(
-                    handle,
-                    PROCESS_NAME_WIN32,
-                    windows::core::PWSTR(buffer.as_mut_ptr()),
-                    &mut size,
-                )
-                .is_ok()
-                {
-                    let path = String::from_utf16_lossy(&buffer[..size as usize]);
-                    let name = std::path::Path::new(&path)
-                        .file_name()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("")
-                        .to_lowercase();
-                    let _ = CloseHandle(handle);
-                    return (name, path);
-                }
-                let _ = CloseHandle(handle);
-            }
-
-            if let Ok(handle) = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid)
-            {
-                let mut buffer = [0u16; 260];
-                let len = K32GetModuleBaseNameW(handle, None, &mut buffer);
-                let _ = CloseHandle(handle);
-                if len > 0 {
-                    return (
-                        String::from_utf16_lossy(&buffer[..len as usize]).to_lowercase(),
-                        String::new(),
-                    );
-                }
-            }
-
-            (String::new(), String::new())
-        }
+    if let Ok(mut state) = context.write() {
+        state.revision = state.revision.wrapping_add(1);
+        // Идентичности HWND на Wayland нет — используем hash процесса+заголовка
+        state.active_window_id = crate::shared::calculate_hash(&(
+            active.process.clone(),
+            active.title.clone(),
+        )) as isize;
+        state.active_process = active.process;
+        state.active_process_path = active.process_path;
+        state.active_window_title = active.title;
+        state.active_window_class = String::new();
+        state.window_width = active.width;
+        state.window_height = active.height;
+        state.fullscreen = active.fullscreen;
+        state.monitor_id = String::new();
+        state.virtual_desktop_id = active.virtual_desktop;
     }
+    true
+}
 
-    fn title(hwnd: HWND) -> String {
-        unsafe {
-            let mut buffer = [0u16; 1024];
-            let len = GetWindowTextW(hwnd, &mut buffer);
-            if len > 0 {
-                String::from_utf16_lossy(&buffer[..len as usize])
-            } else {
-                String::new()
-            }
-        }
-    }
-
-    fn class_name(hwnd: HWND) -> String {
-        unsafe {
-            let mut buffer = [0u16; 256];
-            let len = GetClassNameW(hwnd, &mut buffer);
-            if len > 0 {
-                String::from_utf16_lossy(&buffer[..len as usize])
-            } else {
-                String::new()
-            }
-        }
-    }
-
-    fn virtual_desktop(hwnd: HWND) -> String {
-        unsafe {
-            match CoCreateInstance::<_, IVirtualDesktopManager>(
-                &CLSID_VIRTUAL_DESKTOP_MANAGER,
-                None,
-                CLSCTX_INPROC_SERVER,
-            )
-            .and_then(|manager| manager.GetWindowDesktopId(hwnd))
-            {
-                Ok(guid) => format!("{:?}", guid).to_lowercase(),
-                Err(_) => String::new(),
-            }
-        }
-    }
-
-    fn geometry(hwnd: HWND) -> (i32, i32, bool, String) {
-        unsafe {
-            let mut rect = RECT::default();
-            if GetWindowRect(hwnd, &mut rect).is_err() {
-                return (0, 0, false, String::new());
-            }
-            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-            let mut info = MONITORINFO {
-                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            let _ = GetMonitorInfoW(monitor, &mut info);
-            let fullscreen = (rect.left - info.rcMonitor.left).abs() <= 1
-                && (rect.top - info.rcMonitor.top).abs() <= 1
-                && (rect.right - info.rcMonitor.right).abs() <= 1
-                && (rect.bottom - info.rcMonitor.bottom).abs() <= 1;
-            let monitor_id = format!(
-                "{},{},{},{}",
-                info.rcMonitor.left,
-                info.rcMonitor.top,
-                info.rcMonitor.right,
-                info.rcMonitor.bottom
-            );
-            (
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                fullscreen,
-                monitor_id,
-            )
-        }
-    }
-
-    fn refresh(hwnd: HWND) {
-        if hwnd.0.is_null() {
+fn refresh(context: &AppContextState) {
+    // Wayland-сессия: KWin DBus приоритетен (X11 видит только XWayland-окна),
+    // но X11 доступен и как fallback, когда KWin-интерфейс недоступен.
+    if platform::session_kind() == platform::SessionKind::Wayland
+        && platform::kde::kwin_available()
+    {
+        if refresh_from_kde(context) {
             return;
         }
-        let Some(context) = get_context() else {
-            return;
-        };
-        let (process, path) = process_info(hwnd);
-        let window_title = title(hwnd);
-        let window_class = class_name(hwnd);
-        let (width, height, fullscreen, monitor_id) = geometry(hwnd);
-        let virtual_desktop_id = virtual_desktop(hwnd);
-        if let Ok(mut state) = context.write() {
-            state.revision = state.revision.wrapping_add(1);
-            state.active_window_id = hwnd.0 as isize;
-            state.active_process = process;
-            state.active_process_path = path;
-            state.active_window_title = window_title;
-            state.active_window_class = window_class;
-            state.window_width = width;
-            state.window_height = height;
-            state.fullscreen = fullscreen;
-            state.monitor_id = monitor_id;
-            state.virtual_desktop_id = virtual_desktop_id;
-        }
     }
-
-    // WinEvent constants intentionally kept local: windows-rs moved some of
-    // these constants between feature modules across releases, while the Win32
-    // ABI values are stable.
-    const EVENT_OBJECT_LOCATIONCHANGE_ID: u32 = 0x800B;
-    const EVENT_OBJECT_NAMECHANGE_ID: u32 = 0x800C;
-
-    unsafe extern "system" fn win_event_callback(
-        _: HWINEVENTHOOK,
-        event: u32,
-        hwnd: HWND,
-        _: i32,
-        _: i32,
-        _: u32,
-        _: u32,
-    ) {
-        if hwnd.0.is_null() {
-            return;
-        }
-        let foreground = unsafe { GetForegroundWindow() };
-        if event == EVENT_SYSTEM_FOREGROUND || hwnd == foreground {
-            refresh(hwnd);
-        }
-    }
-
-    pub fn run() {
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-
-            // PostThreadMessageW is reliable only after this thread owns a queue.
-            let mut queue_probe = MSG::default();
-            let _ = PeekMessageW(&mut queue_probe, None, 0, 0, PM_NOREMOVE);
-            TRACKER_THREAD_ID.store(GetCurrentThreadId(), Ordering::SeqCst);
-
-            refresh(GetForegroundWindow());
-            let foreground_hook = SetWinEventHook(
-                EVENT_SYSTEM_FOREGROUND,
-                EVENT_SYSTEM_FOREGROUND,
-                None,
-                Some(win_event_callback),
-                0,
-                0,
-                WINEVENT_OUTOFCONTEXT,
-            );
-            let location_hook = SetWinEventHook(
-                EVENT_OBJECT_LOCATIONCHANGE_ID,
-                EVENT_OBJECT_LOCATIONCHANGE_ID,
-                None,
-                Some(win_event_callback),
-                0,
-                0,
-                WINEVENT_OUTOFCONTEXT,
-            );
-            let name_hook = SetWinEventHook(
-                EVENT_OBJECT_NAMECHANGE_ID,
-                EVENT_OBJECT_NAMECHANGE_ID,
-                None,
-                Some(win_event_callback),
-                0,
-                0,
-                WINEVENT_OUTOFCONTEXT,
-            );
-
-            let mut message = MSG::default();
-            while GetMessageW(&mut message, None, 0, 0).as_bool() {
-                let _ = TranslateMessage(&message);
-                DispatchMessageW(&message);
-            }
-
-            for hook in [foreground_hook, location_hook, name_hook] {
-                if !hook.is_invalid() {
-                    let _ = UnhookWinEvent(hook);
-                }
-            }
-            TRACKER_THREAD_ID.store(0, Ordering::SeqCst);
-            CoUninitialize();
-        }
-    }
-
-    pub fn stop() {
-        let thread_id = TRACKER_THREAD_ID.load(Ordering::SeqCst);
-        if thread_id == 0 {
-            return;
-        }
-        unsafe {
-            let _ = PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
-        }
+    if !refresh_from_x11(context) {
+        // Нет ни Wayland-KWin, ни X11 (например, tty) — контекст не обновляется
     }
 }
 
@@ -290,17 +93,25 @@ pub fn spawn_context_tracker(initial: AppContextState) {
     if TRACKER_STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
+    TRACKER_STOP.store(false, Ordering::SeqCst);
+    let context = match GLOBAL_CONTEXT.get() {
+        Some(context) => context.clone(),
+        None => return,
+    };
     thread::Builder::new()
         .name("context-tracker".into())
-        .spawn(|| {
+        .spawn(move || {
             info!("Context tracker started");
-            #[cfg(target_os = "windows")]
-            win::run();
-            #[cfg(not(target_os = "windows"))]
-            while TRACKER_STARTED.load(Ordering::SeqCst) {
+            refresh(&context);
+            while !TRACKER_STOP.load(Ordering::SeqCst) {
                 thread::sleep(std::time::Duration::from_millis(250));
+                if TRACKER_STOP.load(Ordering::SeqCst) {
+                    break;
+                }
+                refresh(&context);
             }
             TRACKER_STARTED.store(false, Ordering::SeqCst);
+            info!("Context tracker stopped");
         })
         .expect("Failed to start context tracker");
 }
@@ -310,8 +121,6 @@ pub fn start_context_tracker() {
 }
 
 pub fn stop_context_tracker() {
-    #[cfg(target_os = "windows")]
-    win::stop();
-    #[cfg(not(target_os = "windows"))]
+    TRACKER_STOP.store(true, Ordering::SeqCst);
     TRACKER_STARTED.store(false, Ordering::SeqCst);
 }

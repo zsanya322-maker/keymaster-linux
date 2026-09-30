@@ -154,31 +154,8 @@ fn backup_config(path: &Path, reason: &str) -> Result<PathBuf, String> {
 }
 
 fn replace_file_atomically(temp_path: &Path, destination: &Path) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::Storage::FileSystem::{
-            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-        };
-        use windows::core::HSTRING;
-
-        let source = HSTRING::from(temp_path.to_string_lossy().as_ref());
-        let target = HSTRING::from(destination.to_string_lossy().as_ref());
-        unsafe {
-            MoveFileExW(
-                &source,
-                &target,
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-            .map_err(|e| format!("Атомарная замена config.json не удалась: {}", e))?;
-        }
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        fs::rename(temp_path, destination)
-            .map_err(|e| format!("Атомарная замена config.json не удалась: {}", e))
-    }
+    fs::rename(temp_path, destination)
+        .map_err(|e| format!("Атомарная замена config.json не удалась: {}", e))
 }
 
 fn write_config_value(path: &Path, value: &Value) -> Result<(), String> {

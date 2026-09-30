@@ -1,8 +1,8 @@
 /// Persistence Layer — чтение/запись JSON файлов
 ///
-/// Профили хранятся в %APPDATA%\KeyMaster Pro\profiles\
-/// Бэкапы в %APPDATA%\KeyMaster Pro\backups\
-/// Конфиг в %APPDATA%\KeyMaster Pro\config.json
+/// Профили хранятся в $XDG_DATA_HOME/keymaster-linux/profiles/
+/// Бэкапы в $XDG_DATA_HOME/keymaster-linux/backups/
+/// Конфиг в $XDG_DATA_HOME/keymaster-linux/config.json
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -27,10 +27,18 @@ struct LoadedProfile {
     healthy: bool,
 }
 
+/// Каталог данных приложения: $XDG_DATA_HOME/keymaster-linux
+/// (по умолчанию ~/.local/share/keymaster-linux).
 pub fn app_data_dir() -> Result<PathBuf, String> {
-    let app_data =
-        std::env::var("APPDATA").map_err(|e| format!("Не удалось найти APPDATA: {}", e))?;
-    let dir = PathBuf::from(app_data).join("KeyMaster Pro");
+    let base = match std::env::var("XDG_DATA_HOME") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => {
+            let home =
+                std::env::var("HOME").map_err(|e| format!("Не удалось найти HOME: {}", e))?;
+            PathBuf::from(home).join(".local/share")
+        }
+    };
+    let dir = base.join("keymaster-linux");
     fs::create_dir_all(&dir).map_err(|e| format!("Не удалось создать {}: {}", dir.display(), e))?;
     Ok(dir)
 }
@@ -395,31 +403,8 @@ pub fn import_profile_value(value: Value) -> Result<Profile, String> {
 }
 
 fn replace_file_atomically(temp_path: &Path, destination: &Path) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::Storage::FileSystem::{
-            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-        };
-        use windows::core::HSTRING;
-
-        let source = HSTRING::from(temp_path.to_string_lossy().as_ref());
-        let target = HSTRING::from(destination.to_string_lossy().as_ref());
-        unsafe {
-            MoveFileExW(
-                &source,
-                &target,
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-            .map_err(|e| format!("Атомарная замена профиля не удалась: {}", e))?;
-        }
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        fs::rename(temp_path, destination)
-            .map_err(|e| format!("Атомарная замена профиля не удалась: {}", e))
-    }
+    fs::rename(temp_path, destination)
+        .map_err(|e| format!("Атомарная замена профиля не удалась: {}", e))
 }
 
 fn write_profile_value(path: &Path, value: &Value) -> Result<(), String> {

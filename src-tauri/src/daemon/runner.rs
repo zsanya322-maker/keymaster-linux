@@ -1,14 +1,14 @@
 use std::sync::OnceLock;
 /// Daemon main loop
 ///
-/// Точка входа daemon-процесса. Запускает IPC сервер, hook manager,
+/// Точка входа daemon-процесса. Запускает IPC сервер, input capture (evdev),
 /// layer watcher, persistence thread.
 ///
 /// Архитектура потоков:
-/// - Main Thread: Windows Message Loop (для SetWindowsHookEx)
+/// - Reader-потоки evdev: захват клавиатуры/мыши
 /// - Tokio Runtime: IPC Server, Persistence, Layer Watcher
 /// - State: Arc<RwLock<DaemonState>>
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{error, info, warn};
 
@@ -17,13 +17,10 @@ use crate::logging;
 use crate::shared::config;
 use crate::shared::constants;
 
-/// Флаг для graceful shutdown (глобальный, читается из hook callback)
+/// Флаг для graceful shutdown
 static DAEMON_RUNNING: AtomicBool = AtomicBool::new(true);
 
-/// ID главного потока для отправки WM_QUIT
-static MAIN_THREAD_ID: AtomicU32 = AtomicU32::new(0);
-
-/// Глобальный хэндл Tokio для запуска задач из потоков хуков
+/// Глобальный хэндл Tokio для запуска задач из потоков reader'ов
 pub static TOKIO_HANDLE: OnceLock<tokio::runtime::Handle> = OnceLock::new();
 
 /// Запустить асинхронную задачу на глобальном рантайме Tokio
@@ -124,19 +121,6 @@ fn resolve_startup_profile(
     Ok(profile)
 }
 
-#[cfg(target_os = "windows")]
-fn prepare_main_thread_message_queue() {
-    use windows::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW};
-
-    // PostThreadMessageW работает только после создания message queue у потока.
-    // Создаём её ДО запуска фоновых задач, чтобы ранний IPC/watchdog shutdown не
-    // потерял WM_QUIT в startup-гонке.
-    let mut msg = MSG::default();
-    unsafe {
-        let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
-    }
-}
-
 /// Запустить daemon-процесс
 ///
 /// Вызывается из main.rs когда передан флаг `--daemon`.
@@ -144,29 +128,15 @@ fn prepare_main_thread_message_queue() {
 pub fn run_daemon(parent_pid: Option<u32>) -> Result<(), String> {
     DAEMON_RUNNING.store(true, Ordering::SeqCst);
 
-    #[cfg(target_os = "windows")]
-    unsafe {
-        let _ = windows::Win32::UI::WindowsAndMessaging::SetProcessDPIAware();
-    }
-
     logging::init_logging()?;
     info!(
-        "KeyMaster Pro Daemon v{} starting...",
+        "KeyMaster Linux Daemon v{} starting...",
         env!("CARGO_PKG_VERSION")
     );
 
-    #[cfg(target_os = "windows")]
-    unsafe {
-        MAIN_THREAD_ID.store(
-            windows::Win32::System::Threading::GetCurrentThreadId(),
-            Ordering::SeqCst,
-        );
-        prepare_main_thread_message_queue();
-    }
-
-    // Создаём runtime и резервируем first pipe instance ПЕРЕД чтением/миграцией
+    // Создаём runtime и резервируем первый сокет ПЕРЕД чтением/миграцией
     // persistence и перед любыми background engines. Это настоящий startup gate:
-    // второй daemon завершается до simulator/context/global hooks.
+    // второй daemon завершается до simulator/context/input capture.
     let tokio_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .thread_name("km-daemon")
@@ -175,7 +145,7 @@ pub fn run_daemon(parent_pid: Option<u32>) -> Result<(), String> {
         .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
 
     let first_ipc_server =
-        tokio_rt.block_on(async { crate::daemon::ipc::reserve_first_pipe_instance() })?;
+        tokio_rt.block_on(async { crate::daemon::ipc::reserve_first_socket_instance() })?;
 
     // load_config сам безопасно восстанавливает повреждённый legacy config, но
     // future schema / I/O failure считаются fatal: старый daemon не имеет права
@@ -409,8 +379,8 @@ pub fn run_daemon(parent_pid: Option<u32>) -> Result<(), String> {
         s.hooks_installed = true;
     }
 
-    info!("KeyMaster Pro Daemon started and ready");
-    info!("IPC Pipe: {}", constants::IPC_PIPE_NAME);
+    info!("KeyMaster Linux Daemon started and ready");
+    info!("IPC Socket: {}", constants::ipc_socket_path().display());
 
     run_message_loop(&state);
 
@@ -428,132 +398,38 @@ pub fn run_daemon(parent_pid: Option<u32>) -> Result<(), String> {
     tokio_rt.shutdown_background();
     crate::trackers::context_tracker::stop_context_tracker();
 
-    info!("KeyMaster Pro Daemon остановлен");
+    // Убираем сокет, чтобы не оставлять остаток после выхода
+    let _ = std::fs::remove_file(constants::ipc_socket_path());
+
+    info!("KeyMaster Linux Daemon остановлен");
     Ok(())
 }
 
-/// Windows Message Loop
-///
-/// SetWindowsHookEx требует presence message loop в потоке,
-/// где установлен hook. Без GetMessage hook callbacks не вызываются.
+/// Главный цикл daemon-потока: ждёт сигнала остановки.
 fn run_message_loop(_state: &DaemonStateRef) {
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, MSG};
-
-        if !DAEMON_RUNNING.load(Ordering::SeqCst) {
-            return;
-        }
-
-        let mut msg = MSG::default();
-        unsafe {
-            loop {
-                let result = GetMessageW(&mut msg, None, 0, 0).0;
-                if result > 0 {
-                    continue;
-                }
-                if result < 0 {
-                    error!("GetMessageW завершился с ошибкой; daemon останавливается");
-                }
-                break;
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        while DAEMON_RUNNING.load(Ordering::SeqCst) {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
+    while DAEMON_RUNNING.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
-/// Отправить WM_QUIT daemon-процессу для graceful shutdown
+/// Инициировать graceful shutdown daemon-процесса
 pub fn request_shutdown() {
     DAEMON_RUNNING.store(false, Ordering::SeqCst);
-
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
-
-        let thread_id = MAIN_THREAD_ID.load(Ordering::SeqCst);
-        if thread_id != 0 {
-            unsafe {
-                if let Err(e) = PostThreadMessageW(
-                    thread_id,
-                    WM_QUIT,
-                    windows::Win32::Foundation::WPARAM(0),
-                    windows::Win32::Foundation::LPARAM(0),
-                ) {
-                    warn!("Не удалось отправить WM_QUIT главному потоку daemon: {}", e);
-                }
-            }
-        }
-    }
 }
 
 /// Проверить, запущен ли процесс по его PID
 fn is_process_alive(pid: u32) -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::Foundation::{CloseHandle, GetLastError};
-        use windows::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
-
-        unsafe {
-            let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
-                Ok(h) => h,
-                Err(_) => {
-                    let err = GetLastError();
-                    return err == windows::Win32::Foundation::ERROR_ACCESS_DENIED;
-                }
-            };
-
-            let mut exit_code = 0u32;
-            let success = GetExitCodeProcess(handle, &mut exit_code);
-            let _ = CloseHandle(handle);
-
-            if success.is_ok() {
-                // 259 = STILL_ACTIVE / STATUS_PENDING
-                exit_code == 259
-            } else {
-                false
-            }
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        true
-    }
+    std::path::Path::new(&format!("/proc/{}", pid)).exists()
 }
 
-/// Проверить наличие daemon Named Pipe, не подключаясь к нему.
-///
-/// Старый CreateFileW-probe сам становился клиентом pipe и создавал лишний
-/// accept/disconnect цикл. WaitNamedPipeW проверяет наличие/занятость без такого
-/// побочного эффекта.
+/// Проверить наличие живого daemon-сокета (подключением, без побочных эффектов).
+/// Unix-сокет отвечает мгновенно (успех/отказ), таймаут не нужен.
 pub fn is_daemon_running() -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::Foundation::{ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT, GetLastError};
-        use windows::Win32::System::Pipes::WaitNamedPipeW;
-        use windows::core::HSTRING;
+    use std::os::unix::net::UnixStream;
 
-        let pipe_name = HSTRING::from(constants::IPC_PIPE_NAME);
-        unsafe {
-            let ready = WaitNamedPipeW(&pipe_name, 0);
-            if ready.as_bool() {
-                return true;
-            }
-
-            let error = GetLastError();
-            error == ERROR_SEM_TIMEOUT || error == ERROR_PIPE_BUSY
-        }
+    let socket_path = constants::ipc_socket_path();
+    if !socket_path.exists() {
+        return false;
     }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        false
-    }
+    UnixStream::connect(&socket_path).is_ok()
 }

@@ -1,0 +1,10 @@
+# udev-правило KeyMaster Linux
+#
+# Даёт активной сессии пользователя доступ к /dev/uinput, через который
+# daemon воспроизводит remap/макросы (виртуальная клавиатура и мышь).
+#
+# Дополнительно пользователь должен состоять в группе `input`
+# (чтение /dev/input/event*): sudo usermod -aG input $USER
+# и перелогиниться.
+
+KERNEL=="uinput", TAG+="uaccess"

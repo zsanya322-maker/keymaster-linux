@@ -7,12 +7,14 @@ pub mod input_state;
 pub mod ipc;
 pub mod ipc_client;
 pub mod ipc_types;
+pub mod keymap;
 pub mod mouse_triggers;
 pub mod profile_runtime;
 pub mod router;
 /// Daemon-специфичный код (background process)
 ///
-/// Запускается с флагом --daemon. Содержит хуки, IPC сервер, движки.
+/// Запускается с флагом --daemon. Содержит input capture (evdev), IPC сервер,
+/// движки.
 pub mod runner;
 pub mod state;
 

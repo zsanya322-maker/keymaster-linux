@@ -1,8 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-config-schema/schema.json",
-  "productName": "KeyMaster-Pro",
+  "productName": "KeyMaster-Linux",
   "version": "0.5.1",
-  "identifier": "com.keymaster.pro",
+  "identifier": "com.keymaster.linux",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:1420",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "KeyMaster Pro",
+        "title": "KeyMaster Linux",
         "width": 1000,
         "height": 700,
         "minWidth": 800,
@@ -29,7 +29,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["appimage", "deb"],
     "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
@@ -38,14 +38,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "windows": {
-      "nsis": {
-        "installMode": "both",
-        "languages": [
-          "English",
-          "Russian"
-        ],
-        "displayLanguageSelector": true
+    "linux": {
+      "deb": {
+        "depends": []
       }
     }
   },
@@ -54,7 +49,7 @@
       "active": true,
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEUxNUVENDVBOEY5MTNCMDIKUldRQ081R1BXdFJlNFV5SjNyaDBIRVJEWHJMVnpJY2JyM2Q2Z1FKK0N5amFYZS9rQ0Z0WHdYV28K",
       "endpoints": [
-        "https://github.com/zsanya322-maker/keymaster-pro/releases/latest/download/latest.json"
+        "https://github.com/zsanya322-maker/keymaster-linux/releases/latest/download/latest.json"
       ]
     }
   }

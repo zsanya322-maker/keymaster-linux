@@ -1,11 +1,13 @@
-/// IPC Named Pipe Server + JSON-RPC 2.0 Router
+/// IPC Unix Socket Server + JSON-RPC 2.0 Router
 ///
-/// Listens to `\\.\pipe\keymaster-pro-ipc`, accepts JSON-RPC 2.0 requests
-/// from GUI and routes them to handlers.
+/// Listens to `$XDG_RUNTIME_DIR/keymaster-daemon.sock`, accepts JSON-RPC 2.0
+/// requests from GUI and routes them to handlers.
 ///
 /// Protocol: Newline-delimited JSON (one JSON line + \n per message).
+use std::path::Path;
+
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use tokio::net::{UnixListener, UnixStream};
 use tracing::{info, warn};
 
 use crate::daemon::state::DaemonStateRef;
@@ -13,7 +15,7 @@ use crate::shared::constants;
 
 use super::ipc_types::*;
 
-// Profile mutations arrive over independent Named Pipe connections and may be
+// Profile mutations arrive over independent socket connections and may be
 // processed concurrently. Serialize only mutation requests so read/status IPC
 // remains concurrent while read-modify-write operations are atomic relative to
 // every existing GUI/profile mutation.
@@ -29,89 +31,81 @@ fn serializes_profile_mutation(method: &str) -> bool {
         || matches!(method, "set_active_profile" | "apply_onboarding_example")
 }
 
-fn pipe_options(first_instance: bool) -> ServerOptions {
-    let mut options = ServerOptions::new();
-    options
-        .first_pipe_instance(first_instance)
-        .max_instances(16)
-        .out_buffer_size(65536)
-        .in_buffer_size(65536);
-    options
-}
-
-/// Захватить первый Named Pipe instance эксклюзивно.
+/// Захватить первый (эксклюзивный) сокет IPC.
 ///
 /// Вызывается runner'ом синхронно внутри Tokio runtime ДО запуска simulator,
-/// context tracker и global hooks. Поэтому второй daemon не успевает даже
-/// временно установить второй hook engine.
-pub fn reserve_first_pipe_instance() -> Result<NamedPipeServer, String> {
-    let pipe_path = constants::IPC_PIPE_NAME;
-    let server = pipe_options(true).create(pipe_path).map_err(|e| {
-        format!(
-            "Не удалось получить first Named Pipe instance '{}': {}. Вероятно, другой daemon уже запущен.",
-            pipe_path, e
-        )
-    })?;
-    info!("IPC: first pipe instance acquired exclusively");
-    Ok(server)
+/// context tracker и input capture. Поэтому второй daemon не успевает даже
+/// временно запустить второй hook engine. Остаток сокета от упавшего daemon
+/// удаляется, если за ним не живёт активный процесс.
+pub fn reserve_first_socket_instance() -> Result<UnixListener, String> {
+    let socket_path = constants::ipc_socket_path();
+
+    if socket_path.exists() {
+        match std::os::unix::net::UnixStream::connect(&socket_path) {
+            Ok(_) => {
+                return Err(format!(
+                    "Сокет '{}' уже обслуживается другим daemon.",
+                    socket_path.display()
+                ));
+            }
+            Err(_) => {
+                // Остаток после падения — удаляем и биндимся заново
+                let _ = std::fs::remove_file(&socket_path);
+            }
+        }
+    }
+
+    let parent_dir = socket_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let _ = std::fs::create_dir_all(&parent_dir);
+
+    let listener = UnixListener::bind(&socket_path)
+        .map_err(|e| format!("Не удалось занять сокет '{}': {}. Вероятно, другой daemon уже запущен.", socket_path.display(), e))?;
+
+    // Сокет только для текущего пользователя: команды демона не для чужих процессов
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = std::fs::metadata(&socket_path) {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o600);
+        let _ = std::fs::set_permissions(&socket_path, permissions);
+    }
+
+    info!("IPC: first socket instance acquired exclusively ({})", socket_path.display());
+    Ok(listener)
 }
 
-/// Start the IPC server using an already-reserved first pipe instance.
-pub async fn start_ipc_server(
-    state: DaemonStateRef,
-    mut server: NamedPipeServer,
-) -> Result<(), String> {
-    let pipe_path = constants::IPC_PIPE_NAME;
-    info!("IPC сервер запускается на {}", pipe_path);
+/// Start the IPC server using an already-reserved socket listener.
+pub async fn start_ipc_server(state: DaemonStateRef, listener: UnixListener) -> Result<(), String> {
+    let socket_path = constants::ipc_socket_path();
+    info!("IPC сервер запускается на {}", socket_path.display());
 
     loop {
         info!("IPC: waiting for client connection...");
-        if let Err(e) = server.connect().await {
-            warn!("Connection error: {}. Recreating listener in 50ms...", e);
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            server = loop {
-                match pipe_options(false).create(pipe_path) {
-                    Ok(next) => break next,
-                    Err(create_error) => {
-                        warn!(
-                            "Failed to recreate Named Pipe listener: {}. Retrying in 100ms...",
-                            create_error
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                info!("IPC: client connected");
+                let state_for_client = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_client(stream, state_for_client).await {
+                        warn!("IPC: client handling error: {}", e);
                     }
-                }
-            };
-            continue;
+                });
+            }
+            Err(e) => {
+                warn!("Connection error: {}. Retrying in 50ms...", e);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
         }
-        info!("IPC: client connected");
-
-        let state_for_client = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_client(server, state_for_client).await {
-                warn!("IPC: client handling error: {}", e);
-            }
-        });
-
-        server = loop {
-            match pipe_options(false).create(pipe_path) {
-                Ok(next) => break next,
-                Err(e) => {
-                    warn!(
-                        "Failed to create next Named Pipe instance: {}. Retrying in 100ms...",
-                        e
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            }
-        };
     }
 }
 
 /// Handle client connection.
 ///
 /// Reads JSON-RPC requests line by line and sends responses.
-async fn handle_client(pipe: NamedPipeServer, state: DaemonStateRef) -> Result<(), String> {
-    let (reader, mut writer) = tokio::io::split(pipe);
+async fn handle_client(stream: UnixStream, state: DaemonStateRef) -> Result<(), String> {
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
 
     while let Some(line) = lines
@@ -162,9 +156,9 @@ async fn handle_client(pipe: NamedPipeServer, state: DaemonStateRef) -> Result<(
                     }
                     return Ok(());
                 } else {
-                    // Shutdown is special: acknowledge and flush the JSON-RPC response
-                    // before posting WM_QUIT. Otherwise a correct shutdown can look like
-                    // a broken pipe to the GUI.
+                    // Shutdown acknowledges and flushes the JSON-RPC response
+                    // before the daemon stops, so shutdown never looks like a
+                    // broken pipe to the GUI.
                     let shutdown_after_response = req.method == "shutdown";
                     let mutation_guard = if serializes_profile_mutation(&req.method) {
                         Some(PROFILE_MUTATION_LOCK.lock().await)
@@ -281,87 +275,74 @@ async fn route_request(req: JsonRpcRequest, state: &DaemonStateRef) -> JsonRpcRe
     }
 }
 
-fn filetime_to_u64(ft: &windows::Win32::Foundation::FILETIME) -> u64 {
-    ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64)
-}
-
+/// CPU daemon-процесса из /proc/self/stat (дельта к общему времени ядра).
 fn get_current_cpu_usage_percent(state: &DaemonStateRef) -> f64 {
-    use windows::Win32::Foundation::FILETIME;
-    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes, GetSystemTimes};
+    // (utime+stime) в тиках + общее время системы в тиках
+    fn proc_ticks() -> Option<(u64, u64)> {
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        let after_paren = stat.rsplit(')').next()?;
+        let fields: Vec<&str> = after_paren.split_whitespace().collect();
+        // поля после comm: state(1) ... utime=12, stime=13 (индексы с 0: 11, 12)
+        let utime = fields.get(11)?.parse::<u64>().ok()?;
+        let stime = fields.get(12)?.parse::<u64>().ok()?;
+        Some((utime, stime))
+    }
 
-    let mut creation = FILETIME::default();
-    let mut exit = FILETIME::default();
-    let mut kernel = FILETIME::default();
-    let mut user = FILETIME::default();
+    fn sys_ticks() -> Option<u64> {
+        let stat = std::fs::read_to_string("/proc/stat").ok()?;
+        let cpu_line = stat.lines().next()?;
+        let fields: Vec<&str> = cpu_line.split_whitespace().collect();
+        let sum: u64 = fields
+            .iter()
+            .skip(1)
+            .filter_map(|f| f.parse::<u64>().ok())
+            .sum();
+        Some(sum)
+    }
 
-    unsafe {
-        if GetProcessTimes(
-            GetCurrentProcess(),
-            &mut creation,
-            &mut exit,
-            &mut kernel,
-            &mut user,
-        )
-        .is_err()
-        {
-            return 0.0;
-        }
-        let mut sys_idle = FILETIME::default();
-        let mut sys_kernel = FILETIME::default();
-        let mut sys_user = FILETIME::default();
-        if GetSystemTimes(
-            Some(&mut sys_idle),
-            Some(&mut sys_kernel),
-            Some(&mut sys_user),
-        )
-        .is_err()
-        {
-            return 0.0;
-        }
+    let Some((utime, stime)) = proc_ticks() else {
+        return 0.0;
+    };
+    let Some(sys) = sys_ticks() else {
+        return 0.0;
+    };
+    let proc_t = utime + stime;
 
-        let proc_t = filetime_to_u64(&kernel) + filetime_to_u64(&user);
-        let sys_t = filetime_to_u64(&sys_kernel) + filetime_to_u64(&sys_user);
+    let now = std::time::Instant::now();
+    if let Ok(s) = state.read() {
+        if let Ok(mut last_lock) = s.cpu_tracking.lock() {
+            if let Some((last_proc, last_sys, last_time)) = *last_lock {
+                let proc_diff = proc_t.saturating_sub(last_proc);
+                let sys_diff = sys.saturating_sub(last_sys);
+                let time_diff = now.duration_since(last_time).as_secs_f64();
 
-        let now = std::time::Instant::now();
+                *last_lock = Some((proc_t, sys, now));
 
-        if let Ok(s) = state.read() {
-            if let Ok(mut last_lock) = s.cpu_tracking.lock() {
-                if let Some((last_proc, last_sys, last_time)) = *last_lock {
-                    let proc_diff = proc_t.saturating_sub(last_proc);
-                    let sys_diff = sys_t.saturating_sub(last_sys);
-                    let time_diff = now.duration_since(last_time).as_secs_f64();
-
-                    *last_lock = Some((proc_t, sys_t, now));
-
-                    if sys_diff > 0 && time_diff > 0.0 {
-                        let usage = (proc_diff as f64 / sys_diff as f64) * 100.0;
-                        return (usage * 100.0).round() / 100.0;
-                    }
-                } else {
-                    *last_lock = Some((proc_t, sys_t, now));
+                if sys_diff > 0 && time_diff > 0.0 {
+                    let usage = (proc_diff as f64 / sys_diff as f64) * 100.0;
+                    return (usage * 100.0).round() / 100.0;
                 }
+            } else {
+                *last_lock = Some((proc_t, sys, now));
             }
         }
     }
     0.0
 }
 
+/// RAM daemon-процесса из /proc/self/status (VmRSS).
 fn get_current_ram_usage_mb() -> f64 {
-    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-    use windows::Win32::System::Threading::GetCurrentProcess;
-
-    let mut counters = PROCESS_MEMORY_COUNTERS::default();
-    unsafe {
-        if GetProcessMemoryInfo(
-            GetCurrentProcess(),
-            &mut counters,
-            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        )
-        .is_ok()
-        {
-            let bytes = counters.WorkingSetSize;
-            let mb = bytes as f64 / 1024.0 / 1024.0;
-            return (mb * 10.0).round() / 10.0;
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb: f64 = rest
+                    .trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse()
+                    .unwrap_or(0.0);
+                return ((kb / 1024.0) * 10.0).round() / 10.0;
+            }
         }
     }
     0.0
@@ -373,7 +354,7 @@ fn get_current_ram_usage_mb() -> f64 {
 async fn handle_get_status(state: &DaemonStateRef) -> Result<serde_json::Value, JsonRpcError> {
     // CPU tracking acquires state internally. Compute it before taking the
     // snapshot lock below so get_status never recursively acquires the same
-    // Windows RwLock on one request path.
+    // RwLock on one request path.
     let cpu_usage = get_current_cpu_usage_percent(state);
     let ram_usage = get_current_ram_usage_mb();
 
@@ -399,7 +380,7 @@ async fn handle_get_status(state: &DaemonStateRef) -> Result<serde_json::Value, 
     }))
 }
 
-/// Mark daemon shutdown as requested. The actual WM_QUIT is posted by
+/// Mark daemon shutdown as requested. The actual shutdown is performed by
 /// handle_client only after the JSON-RPC response has been flushed.
 async fn handle_shutdown(state: &DaemonStateRef) -> Result<serde_json::Value, JsonRpcError> {
     info!("IPC: shutdown command received");

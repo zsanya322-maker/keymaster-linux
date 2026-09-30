@@ -1,11 +1,11 @@
-/// IPC Named Pipe Client
+/// IPC Unix Socket Client
 ///
-/// Клиент для GUI-процесса. Подключается к Named Pipe daemon'а,
+/// Клиент для GUI-процесса. Подключается к Unix-сокету daemon'а,
 /// отправляет JSON-RPC 2.0 запросы и получает ответы.
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::windows::named_pipe::ClientOptions;
+use tokio::net::UnixStream;
 use tracing::debug;
 
 use super::ipc_types::*;
@@ -25,18 +25,18 @@ pub async fn call(
     method: &str,
     params: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let pipe_path = constants::IPC_PIPE_NAME;
+    let socket_path = constants::ipc_socket_path();
     debug!("IPC Client → {} {:?}", method, params);
 
-    let mut pipe = None;
+    let mut stream = None;
     let mut last_err = None;
 
     // Startup/restart окна иногда длиннее 100 мс. Даём до ~500 мс на transient
     // race, не превращая отсутствие daemon в многосекундное зависание UI.
     for _ in 0..IPC_CONNECT_ATTEMPTS {
-        match ClientOptions::new().open(pipe_path) {
-            Ok(p) => {
-                pipe = Some(p);
+        match UnixStream::connect(&socket_path).await {
+            Ok(s) => {
+                stream = Some(s);
                 break;
             }
             Err(e) => {
@@ -46,14 +46,15 @@ pub async fn call(
         }
     }
 
-    let pipe = match pipe {
-        Some(p) => p,
+    let stream = match stream {
+        Some(s) => s,
         None => {
             let err_msg = last_err
                 .map(|e| e.to_string())
                 .unwrap_or_else(|| "Unknown error".to_string());
             return Err(format!(
-                "Failed to connect to daemon pipe: {}. Is daemon running?",
+                "Failed to connect to daemon socket {}: {}. Is daemon running?",
+                socket_path.display(),
                 err_msg
             ));
         }
@@ -72,7 +73,7 @@ pub async fn call(
         .map_err(|e| format!("Ошибка сериализации запроса: {}", e))?;
     request_bytes.push('\n');
 
-    let (reader, mut writer) = tokio::io::split(pipe);
+    let (reader, mut writer) = tokio::io::split(stream);
     tokio::time::timeout(IPC_IO_TIMEOUT, async {
         writer
             .write_all(request_bytes.as_bytes())

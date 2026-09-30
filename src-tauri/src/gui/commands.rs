@@ -1,15 +1,12 @@
 /// Tauri commands (invoke handlers)
 ///
 /// GUI вызывает эти функции через tauri.invoke().
-/// Большинство runtime-команд перенаправляются в Daemon через Named Pipe IPC,
+/// Большинство runtime-команд перенаправляются в Daemon через Unix-сокет IPC,
 /// а GUI-конфигурация читается/пишется напрямую, чтобы настройки сохранялись
 /// даже при остановленном демоне.
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::State;
 use tracing::{info, warn};
-
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
 
 /// Состояние GUI процесса
 pub struct GuiState {
@@ -57,18 +54,19 @@ pub fn spawn_daemon(state: State<'_, GuiState>) -> Result<serde_json::Value, Str
     }
 
     let current_pid = std::process::id();
-    let pipe_path = crate::shared::constants::IPC_PIPE_NAME;
+    let socket_path = crate::shared::constants::ipc_socket_path();
     info!(
         "Запуск daemon-процесса: {} --daemon --parent-pid {}",
         exe_path, current_pid
     );
-    info!("Ожидаемый Named Pipe: {}", pipe_path);
+    info!("Ожидаемый IPC сокет: {}", socket_path.display());
 
+    use std::os::unix::process::CommandExt;
     let child = match std::process::Command::new(exe_path)
         .arg("--daemon")
         .arg("--parent-pid")
         .arg(current_pid.to_string())
-        .creation_flags(0x00000008)
+        .process_group(0)
         .spawn()
     {
         Ok(c) => c,
@@ -248,95 +246,27 @@ pub async fn restart_app(
     app_handle.restart();
 }
 
-/// Перезапустить приложение от имени Администратора (UAC).
+/// Перезапуск от имени администратора на Linux не требуется (нет UAC):
+/// команда сохранена для совместимости с frontend и сообщает об отказе.
 #[tauri::command]
-pub async fn restart_as_admin(state: State<'_, GuiState>) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::UI::Shell::ShellExecuteW;
-        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-        use windows::core::HSTRING;
-
-        let exe_path = state
-            .exe_path
-            .clone()
-            .ok_or("Не удалось определить путь к исполняемому файлу")?;
-
-        // Не запускаем elevated-копию, пока старый daemon не исчез полностью.
-        stop_daemon_before_process_transition("restart_as_admin", &state).await?;
-
-        let verb = HSTRING::from("runas");
-        let file = HSTRING::from(exe_path);
-        // Elevated-процесс создаётся пока старый GUI ещё жив. Он подождёт ДО
-        // запуска Tauri/single-instance, чтобы старый instance lock успел уйти.
-        let parameters = HSTRING::from("--gui-delay-ms 650");
-
-        let launch_result =
-            unsafe { ShellExecuteW(None, &verb, &file, &parameters, None, SW_SHOWNORMAL) };
-        let launch_code = launch_result.0 as isize;
-
-        if launch_code <= 32 {
-            warn!(
-                "restart_as_admin: ShellExecuteW failed/cancelled, code={}",
-                launch_code
-            );
-            // Мы уже штатно остановили daemon. Если пользователь отменил UAC,
-            // оставляем старое GUI открытым и возвращаем ему engine обратно.
-            state.spawning.store(false, Ordering::SeqCst);
-            if let Err(error) = spawn_daemon(state) {
-                warn!(
-                    "restart_as_admin: не удалось восстановить daemon: {}",
-                    error
-                );
-            }
-            return Err(format!(
-                "Запуск от Администратора отменён или завершился ошибкой (код {})",
-                launch_code
-            ));
-        }
-
-        std::process::exit(0);
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        Err("Unsupported on this OS".to_string())
-    }
+pub async fn restart_as_admin(_state: State<'_, GuiState>) -> Result<(), String> {
+    Err("Unsupported on this OS".to_string())
 }
 
-/// Проверить, запущено ли приложение с правами Администратора (UAC).
+/// Проверить, запущено ли приложение с повышенными привилегиями (root).
 #[tauri::command]
 pub fn is_elevated() -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::Security::{
-            GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
-        };
-        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-        unsafe {
-            let mut token = windows::Win32::Foundation::HANDLE::default();
-            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_ok() {
-                let mut elevation = TOKEN_ELEVATION::default();
-                let mut size = 0;
-                if GetTokenInformation(
-                    token,
-                    TokenElevation,
-                    Some(&mut elevation as *mut _ as *mut _),
-                    std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-                    &mut size,
-                )
-                .is_ok()
-                {
-                    return elevation.TokenIsElevated != 0;
-                }
-            }
-        }
-        false
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        false
-    }
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                line.strip_prefix("Uid:")
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .and_then(|uid| uid.parse::<u32>().ok())
+            })
+        })
+        .map(|uid| uid == 0)
+        .unwrap_or(false)
 }
 
 /// Загрузить конфигурацию приложения напрямую из config.json.
@@ -379,9 +309,48 @@ pub fn update_gui_config(patch: serde_json::Value) -> Result<serde_json::Value, 
         .map_err(|e| format!("Ошибка сериализации сохранённого config: {}", e))
 }
 
-#[cfg(target_os = "windows")]
-fn ai_secret_target(provider_id: &str) -> String {
-    format!("KeyMaster-Pro/AI/{}", provider_id)
+/// Хранилище AI-ключей: JSON-файл 0600 в конфигурационном каталоге
+/// ($XDG_DATA_HOME/keymaster-linux/ai-secrets.json).
+fn ai_secrets_path() -> Result<std::path::PathBuf, String> {
+    Ok(crate::shared::persistence::app_data_dir()?.join("ai-secrets.json"))
+}
+
+fn read_ai_secrets() -> serde_json::Map<String, serde_json::Value> {
+    let Ok(path) = ai_secrets_path() else {
+        return serde_json::Map::new();
+    };
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn write_ai_secrets(secrets: serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = ai_secrets_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Не удалось создать {}: {}", parent.display(), e))?;
+    }
+    let data = serde_json::to_string_pretty(&secrets)
+        .map_err(|e| format!("Ошибка сериализации секретов: {}", e))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .map_err(|e| format!("Не удалось открыть {}: {}", path.display(), e))?;
+    file.write_all(data.as_bytes())
+        .map_err(|e| format!("Не удалось записать секреты: {}", e))?;
+    let mut permissions = std::fs::metadata(&path)
+        .map_err(|e| e.to_string())?
+        .permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(&path, permissions).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -393,112 +362,23 @@ pub fn ai_secret_set(provider_id: String, api_key: String) -> Result<(), String>
         return Err("AI API key is too large".to_string());
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::Security::Credentials::{
-            CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredWriteW,
-        };
-        use windows::core::PWSTR;
-
-        let mut target: Vec<u16> = ai_secret_target(&provider_id)
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let mut username: Vec<u16> = "KeyMaster-Pro"
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let mut blob = api_key.into_bytes();
-        let credential = CREDENTIALW {
-            Type: CRED_TYPE_GENERIC,
-            TargetName: PWSTR(target.as_mut_ptr()),
-            CredentialBlobSize: u32::try_from(blob.len())
-                .map_err(|_| "AI API key is too large".to_string())?,
-            CredentialBlob: blob.as_mut_ptr(),
-            Persist: CRED_PERSIST_LOCAL_MACHINE,
-            UserName: PWSTR(username.as_mut_ptr()),
-            ..Default::default()
-        };
-
-        let result = unsafe { CredWriteW(&credential, 0) }
-            .map_err(|error| format!("Windows Credential Manager write failed: {error}"));
-        blob.fill(0);
-        result?;
-        return Ok(());
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (provider_id, api_key);
-        Err("Secure AI secret storage is currently available on Windows only".to_string())
-    }
+    let mut secrets = read_ai_secrets();
+    secrets.insert(provider_id, serde_json::Value::String(api_key));
+    write_ai_secrets(secrets)
 }
 
 #[tauri::command]
 pub fn ai_secret_get(provider_id: String) -> Result<Option<String>, String> {
-    #[cfg(target_os = "windows")]
-    {
-        use std::ffi::c_void;
-        use windows::Win32::Security::Credentials::{
-            CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
-        };
-        use windows::core::HSTRING;
-
-        let target = HSTRING::from(ai_secret_target(&provider_id));
-        let mut credential_ptr: *mut CREDENTIALW = std::ptr::null_mut();
-        match unsafe { CredReadW(&target, CRED_TYPE_GENERIC, None, &mut credential_ptr) } {
-            Ok(()) => {
-                if credential_ptr.is_null() {
-                    return Ok(None);
-                }
-                let credential = unsafe { &*credential_ptr };
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        credential.CredentialBlob,
-                        credential.CredentialBlobSize as usize,
-                    )
-                };
-                let value = String::from_utf8(bytes.to_vec())
-                    .map_err(|_| "Stored AI API key is not valid UTF-8".to_string());
-                unsafe { CredFree(credential_ptr as *const c_void) };
-                value.map(Some)
-            }
-            Err(error) => {
-                // HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
-                if error.code().0 as u32 == 0x80070490 {
-                    Ok(None)
-                } else {
-                    Err(format!("Windows Credential Manager read failed: {error}"))
-                }
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = provider_id;
-        Err("Secure AI secret storage is currently available on Windows only".to_string())
-    }
+    let secrets = read_ai_secrets();
+    Ok(secrets
+        .get(&provider_id)
+        .and_then(|value| value.as_str())
+        .map(|s| s.to_string()))
 }
 
 #[tauri::command]
 pub fn ai_secret_delete(provider_id: String) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::Security::Credentials::{CRED_TYPE_GENERIC, CredDeleteW};
-        use windows::core::HSTRING;
-
-        let target = HSTRING::from(ai_secret_target(&provider_id));
-        match unsafe { CredDeleteW(&target, CRED_TYPE_GENERIC, None) } {
-            Ok(()) => Ok(()),
-            Err(error) if error.code().0 as u32 == 0x80070490 => Ok(()),
-            Err(error) => Err(format!("Windows Credential Manager delete failed: {error}")),
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = provider_id;
-        Err("Secure AI secret storage is currently available on Windows only".to_string())
-    }
+    let mut secrets = read_ai_secrets();
+    secrets.remove(&provider_id);
+    write_ai_secrets(secrets)
 }

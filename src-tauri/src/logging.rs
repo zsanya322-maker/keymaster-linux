@@ -1,8 +1,7 @@
 use std::fs;
-use std::path::PathBuf;
 /// Logging setup — tracing subscriber
 ///
-/// Логирование в файл %APPDATA%\KeyMaster Pro\logs\
+/// Логирование в файл $XDG_DATA_HOME/keymaster-linux/logs/
 /// Каждый запуск daemon создаёт новый файл daemon-YYYY-MM-DD_HH-MM-SS.log,
 /// чтобы было удобно отлаживать конкретную сессию без 700к-строчного монолита.
 /// Старые файлы не удаляются автоматически (чистка ручная).
@@ -18,10 +17,8 @@ pub fn init_logging() -> Result<(), String> {
         }
     });
 
-    // Получаем путь к APPDATA/KeyMaster Pro/logs
-    let app_data =
-        std::env::var("APPDATA").map_err(|e| format!("Не удалось получить APPDATA: {}", e))?;
-    let log_dir = PathBuf::from(app_data).join("KeyMaster Pro").join("logs");
+    // Путь к data dir/logs
+    let log_dir = crate::shared::persistence::app_data_dir()?.join("logs");
 
     // Создаем директорию логов
     fs::create_dir_all(&log_dir).map_err(|e| {
@@ -62,7 +59,7 @@ pub fn init_logging() -> Result<(), String> {
 
     // Печатаем заголовок сессии — удобно искать нужный файл в папке с логами.
     tracing::info!(
-        "=== KeyMaster Pro daemon session started at {} ===",
+        "=== KeyMaster Linux daemon session started at {} ===",
         timestamp
     );
     tracing::info!("Log file: {}", log_path.display());

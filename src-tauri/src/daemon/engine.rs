@@ -439,23 +439,11 @@ fn execute_actions(
                     // Позицию курсора фиксируем в момент запуска макроса, но команду
                     // возврата добавляем в КОНЕЦ macro-job. Раньше все команды, включая
                     // Delay, шли в общую очередь и могли задерживать обычный remap.
-                    #[cfg(target_os = "windows")]
-                    {
-                        if let Some(state_ref) = state {
-                            if let Ok(s) = state_ref.read() {
-                                if s.restore_mouse_after_macro {
-                                    let mut point =
-                                        windows::Win32::Foundation::POINT { x: 0, y: 0 };
-                                    unsafe {
-                                        let _ =
-                                            windows::Win32::UI::WindowsAndMessaging::GetCursorPos(
-                                                &mut point,
-                                            );
-                                    }
-                                    macro_commands.push(SimulatorCommand::MouseAbsolute {
-                                        x: point.x,
-                                        y: point.y,
-                                    });
+                    if let Some(state_ref) = state {
+                        if let Ok(s) = state_ref.read() {
+                            if s.restore_mouse_after_macro {
+                                if let Some((x, y)) = crate::platform::x11::cursor_position() {
+                                    macro_commands.push(SimulatorCommand::MouseAbsolute { x, y });
                                 }
                             }
                         }
@@ -623,7 +611,7 @@ pub fn tick_tap_holds(state: Option<&DaemonStateRef>) {
 
 pub fn process_keyboard_event(
     vk_code: u8,
-    scan_code: u16,
+    _scan_code: u16,
     is_key_down: bool,
     _flags: u32,
     event_modifiers: u16,
@@ -867,7 +855,7 @@ pub fn process_keyboard_event(
             if let Ok(mut input) = s.text_input.lock() {
                 input.prepare(now, window_id);
             }
-        } else if let Some(c) = vk_to_char(vk_code, scan_code) {
+        } else if let Some(c) = vk_to_char(vk_code, event_modifiers) {
             let (before, prospective) = match s.text_input.lock() {
                 Ok(mut input) => {
                     input.prepare(now, window_id);
@@ -1414,43 +1402,11 @@ pub fn vk_to_key_name(vk: u8) -> String {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn vk_to_char(vk: u8, hook_scan_code: u16) -> Option<char> {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetKeyboardLayout, GetKeyboardState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, ToUnicodeEx,
-    };
-
-    match vk {
-        0x20 => return Some(' '),
-        0x09 => return Some('\t'),
-        0x0D => return Some('\n'),
-        _ => {}
-    }
-
-    unsafe {
-        let mut key_state = [0u8; 256];
-        if GetKeyboardState(&mut key_state).is_err() {
-            return None;
-        }
-        let layout = GetKeyboardLayout(0);
-        let scan_code = if hook_scan_code == 0 {
-            MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX)
-        } else {
-            hook_scan_code as u32
-        };
-        let mut buf = [0u16; 4];
-        let result = ToUnicodeEx(vk as u32, scan_code, &key_state, &mut buf, 0, Some(layout));
-        if result > 0 {
-            char::from_u32(buf[0] as u32).filter(|c| !c.is_control())
-        } else {
-            None
-        }
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn vk_to_char(_vk: u8, _scan_code: u16) -> Option<char> {
-    None
+/// VK → символ по US-раскладке с учётом текущего shift-состояния события
+/// (на Windows использовался ToUnicodeEx с активной раскладкой).
+fn vk_to_char(vk: u8, event_modifiers: u16) -> Option<char> {
+    let shift = event_modifiers & crate::schemas::frontend::key_modifiers::SHIFT != 0;
+    crate::daemon::keymap::vk_to_char_us(vk, shift)
 }
 
 #[cfg(test)]

@@ -1,11 +1,12 @@
 pub mod context;
-/// KeyMaster Pro Library
+/// KeyMaster Linux Library
 ///
 /// Handles Tauri GUI initialization, plugin registration, and commands.
 pub mod daemon;
 pub mod gui;
 pub mod logging;
 pub mod mcp;
+pub mod platform;
 pub mod schemas;
 pub mod shared;
 pub mod simulator;
@@ -69,16 +70,16 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 use tauri::Emitter;
                 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-                use tokio::net::windows::named_pipe::ClientOptions;
+                use tokio::net::UnixStream;
 
                 const SUBSCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
                 const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
                 loop {
                     tokio::time::sleep(RECONNECT_DELAY).await;
-                    let pipe_path = crate::shared::constants::IPC_PIPE_NAME;
+                    let socket_path = crate::shared::constants::ipc_socket_path();
 
-                    let mut pipe = match ClientOptions::new().open(pipe_path) {
+                    let mut pipe = match UnixStream::connect(&socket_path).await {
                         Ok(pipe) => pipe,
                         Err(_) => continue,
                     };
@@ -153,7 +154,7 @@ pub fn run() {
                         continue;
                     }
 
-                    tracing::info!("GUI event listener subscribed to Named Pipe: {}", pipe_path);
+                    tracing::info!("GUI event listener subscribed to IPC socket: {}", socket_path.display());
                     while let Ok(Some(line)) = lines.next_line().await {
                         match serde_json::from_str::<crate::gui::events::DaemonEvent>(&line) {
                             Ok(event) => {

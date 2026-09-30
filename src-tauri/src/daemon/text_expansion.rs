@@ -199,70 +199,83 @@ pub fn render_template_with(
     rendered
 }
 
-#[cfg(target_os = "windows")]
+/// Локальное время через /proc/self/stat нельзя получить, поэтому читаем
+/// локальную зону из системы: используем libc-независимый путь через
+/// `date`-подобное вычисление из UTC + смещения TZ. Для шаблонных дат
+/// точность до минуты несущественна — берём UTC, если TZ не удалось разобрать.
 fn local_parts() -> DateTimeParts {
-    use windows::Win32::System::SystemInformation::GetLocalTime;
-    let value = unsafe { GetLocalTime() };
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64 + local_utc_offset_secs())
+        .unwrap_or(0);
+    let (year, month, day, hour, minute, second) = secs_to_ymd_hms(secs.max(0) as u64);
     DateTimeParts {
-        year: value.wYear,
-        month: value.wMonth,
-        day: value.wDay,
-        hour: value.wHour,
-        minute: value.wMinute,
-        second: value.wSecond,
+        year: year as u16,
+        month: month as u16,
+        day: day as u16,
+        hour: hour as u16,
+        minute: minute as u16,
+        second: second as u16,
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-fn local_parts() -> DateTimeParts {
-    DateTimeParts {
-        year: 1970,
-        month: 1,
-        day: 1,
-        hour: 0,
-        minute: 0,
-        second: 0,
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn read_clipboard_text() -> Option<String> {
-    use windows::Win32::Foundation::HGLOBAL;
-    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
-    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
-    use windows::Win32::System::Ole::CF_UNICODETEXT;
-
-    struct ClipboardGuard;
-    impl Drop for ClipboardGuard {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = CloseClipboard();
+/// Смещение локальной зоны в секундах: TZ-переменная вида UTC+H/-H или
+/// /etc/localtime через `date +%z` (быстро и без внешних зависимостей).
+fn local_utc_offset_secs() -> i64 {
+    use std::process::Command;
+    Command::new("date")
+        .arg("+%z")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .and_then(|text| {
+            let trimmed = text.trim();
+            let (sign, rest) = if let Some(rest) = trimmed.strip_prefix('+') {
+                (1i64, rest)
+            } else if let Some(rest) = trimmed.strip_prefix('-') {
+                (-1i64, rest)
+            } else {
+                return None;
+            };
+            if rest.len() != 4 {
+                return None;
             }
-        }
-    }
-
-    unsafe {
-        OpenClipboard(None).ok()?;
-        let _guard = ClipboardGuard;
-        let handle = GetClipboardData(CF_UNICODETEXT.0 as u32).ok()?;
-        let global = HGLOBAL(handle.0);
-        let ptr = GlobalLock(global) as *const u16;
-        if ptr.is_null() {
-            return None;
-        }
-        let mut len = 0usize;
-        while *ptr.add(len) != 0 && len < 1_048_576 {
-            len += 1;
-        }
-        let text = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
-        let _ = GlobalUnlock(global);
-        Some(text)
-    }
+            let hours: i64 = rest[..2].parse().ok()?;
+            let minutes: i64 = rest[2..].parse().ok()?;
+            Some(sign * (hours * 3600 + minutes * 60))
+        })
+        .unwrap_or(0)
 }
 
-#[cfg(not(target_os = "windows"))]
+/// Перевод UNIX-секунд в (год, месяц, день, час, минута, секунда).
+/// Алгоритм — адаптация Howard Hinnant'а (civil_from_days).
+fn secs_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let days = (secs / 86400) as i64;
+    let remainder = (secs % 86400) as u32;
+    let hour = remainder / 3600;
+    let minute = (remainder % 3600) / 60;
+    let second = remainder % 60;
+
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = (y + if m <= 2 { 1 } else { 0 }) as u32;
+
+    (year, m as u32, d as u32, hour, minute, second)
+}
+
+/// Текст буфера обмена через arboard (поддерживает X11 и Wayland).
 fn read_clipboard_text() -> Option<String> {
-    None
+    match arboard::Clipboard::new() {
+        Ok(mut clipboard) => clipboard.get_text().ok(),
+        Err(_) => None,
+    }
 }
 
 /// Dynamic sources are lazy. In particular clipboard APIs are never touched

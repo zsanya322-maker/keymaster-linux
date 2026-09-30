@@ -53,57 +53,8 @@ fn switch_profile(direction: isize) {
 }
 
 pub fn setup_tray(app: &App) -> Result<(), Box<dyn std::error::Error>> {
-    let is_elevated = {
-        #[cfg(target_os = "windows")]
-        {
-            use windows::Win32::Security::{
-                GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
-            };
-            use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-            unsafe {
-                let mut token = windows::Win32::Foundation::HANDLE::default();
-                if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_ok() {
-                    let mut elevation = TOKEN_ELEVATION::default();
-                    let mut size = 0;
-                    let elevated = GetTokenInformation(
-                        token,
-                        TokenElevation,
-                        Some(&mut elevation as *mut _ as *mut _),
-                        std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-                        &mut size,
-                    )
-                    .is_ok()
-                        && elevation.TokenIsElevated != 0;
-                    let _ = windows::Win32::Foundation::CloseHandle(token);
-                    elevated
-                } else {
-                    false
-                }
-            }
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            false
-        }
-    };
-
-    let mut menu_builder = MenuBuilder::new(app)
-        .item(&MenuItemBuilder::with_id(MENU_SHOW, "Показать KeyMaster Pro").build(app)?);
-
-    if !is_elevated {
-        menu_builder = menu_builder.item(
-            &MenuItemBuilder::with_id(MENU_RESTART_ADMIN, "🛡️ Перезапустить от Администратора")
-                .build(app)?,
-        );
-    } else {
-        menu_builder = menu_builder.item(
-            &MenuItemBuilder::with_id(MENU_RESTART_ADMIN, "🛡️ Запущено как Администратор")
-                .enabled(false)
-                .build(app)?,
-        );
-    }
-
-    let menu = menu_builder
+    let menu = MenuBuilder::new(app)
+        .item(&MenuItemBuilder::with_id(MENU_SHOW, "Показать KeyMaster Linux").build(app)?)
         .separator()
         .item(&MenuItemBuilder::with_id(MENU_PROFILE_PREV, "← Предыдущий профиль").build(app)?)
         .item(&MenuItemBuilder::with_id(MENU_PROFILE_NEXT, "Следующий профиль →").build(app)?)
@@ -121,7 +72,7 @@ pub fn setup_tray(app: &App) -> Result<(), Box<dyn std::error::Error>> {
 
     let tray = TrayIconBuilder::new()
         .icon(icon)
-        .tooltip("KeyMaster Pro - active")
+        .tooltip("KeyMaster Linux - active")
         .menu(&menu)
         .on_menu_event(move |app, event| match event.id().as_ref() {
             MENU_SHOW => show_main_window(app),

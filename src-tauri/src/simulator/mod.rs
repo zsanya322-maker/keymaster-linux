@@ -2,22 +2,15 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, SendError, Sender};
 use std::thread;
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 pub mod macro_player;
 pub mod system;
 
 use self::macro_player::{MacroExecutor, MacroPlayer};
+use crate::daemon::keymap;
+use crate::platform;
 use crate::schemas::engine::{MacroPlaybackConfig, SimulatorCommand};
-
-#[cfg(target_os = "windows")]
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
-    SendInput,
-};
 
 /// Два независимых канала симуляции.
 ///
@@ -119,230 +112,86 @@ fn execute_command(cmd: SimulatorCommand) {
     }
 }
 
-#[cfg(target_os = "windows")]
 fn send_key(vk: u8, is_keyup: bool) {
-    let input = INPUT {
-        r#type: INPUT_KEYBOARD,
-        Anonymous: INPUT_0 {
-            ki: KEYBDINPUT {
-                wVk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(vk as u16),
-                wScan: 0,
-                dwFlags: if is_keyup {
-                    KEYEVENTF_KEYUP
-                } else {
-                    Default::default()
-                },
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
+    let Some(code) = keymap::vk_to_evdev(vk) else {
+        return;
     };
-
-    unsafe {
-        let _ = SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
-    }
+    let _ = platform::uinput::emit_key(code, if is_keyup { 0 } else { 1 });
 }
 
-#[cfg(not(target_os = "windows"))]
-fn send_key(_vk: u8, _is_keyup: bool) {}
-
-#[cfg(target_os = "windows")]
 fn send_mouse(button: u8, is_keyup: bool) {
-    let flags;
-    let mut mouse_data = 0;
-
-    match button {
-        1 => {
-            flags = if is_keyup {
-                MOUSEEVENTF_LEFTUP
-            } else {
-                MOUSEEVENTF_LEFTDOWN
-            }
-        }
-        2 => {
-            flags = if is_keyup {
-                MOUSEEVENTF_RIGHTUP
-            } else {
-                MOUSEEVENTF_RIGHTDOWN
-            }
-        }
-        3 => {
-            flags = if is_keyup {
-                MOUSEEVENTF_MIDDLEUP
-            } else {
-                MOUSEEVENTF_MIDDLEDOWN
-            }
-        }
-        4 => {
-            flags = if is_keyup {
-                MOUSEEVENTF_XUP
-            } else {
-                MOUSEEVENTF_XDOWN
-            };
-            mouse_data = 1;
-        }
-        5 => {
-            flags = if is_keyup {
-                MOUSEEVENTF_XUP
-            } else {
-                MOUSEEVENTF_XDOWN
-            };
-            mouse_data = 2;
-        }
-        _ => return,
-    }
-
-    let input = INPUT {
-        r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 {
-            mi: MOUSEINPUT {
-                dx: 0,
-                dy: 0,
-                mouseData: mouse_data,
-                dwFlags: flags,
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
+    let Some(code) = keymap::button_to_evdev(button) else {
+        return;
     };
-
-    unsafe {
-        let _ = SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
-    }
+    let _ = platform::uinput::emit_mouse_button(code, if is_keyup { 0 } else { 1 });
 }
 
-#[cfg(not(target_os = "windows"))]
-fn send_mouse(_button: u8, _is_keyup: bool) {}
-
-#[cfg(target_os = "windows")]
+/// Набор текста через uinput (US-раскладка). Не-ASCII символы в MVP
+/// пропускаются с предупреждением: произвольный Unicode требует
+/// zwp_virtual_keyboard (Wayland) или XTEST+keymap (X11).
 fn type_string(text: &str) {
-    let utf16: Vec<u16> = text.encode_utf16().collect();
-    let mut inputs = Vec::with_capacity(utf16.len() * 2);
-
-    for &ch in &utf16 {
-        inputs.push(INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(0),
-                    wScan: ch,
-                    dwFlags: KEYEVENTF_UNICODE,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        });
-        inputs.push(INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(0),
-                    wScan: ch,
-                    dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        });
-    }
-
-    if !inputs.is_empty() {
-        unsafe {
-            let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    for ch in text.chars() {
+        let Some((vk, shift)) = keymap::char_to_vk_us(ch) else {
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                warn!("type_string: символ '{}' (не-ASCII/US) пропущен — расширенный ввод текста будет в следующих версиях", ch);
+            }
+            continue;
+        };
+        let Some(code) = keymap::vk_to_evdev(vk) else {
+            continue;
+        };
+        if shift {
+            if let Some(shift_code) = keymap::vk_to_evdev(0xA0) {
+                let _ = platform::uinput::emit_key(shift_code, 1);
+            }
+        }
+        let _ = platform::uinput::emit_key(code, 1);
+        let _ = platform::uinput::emit_key(code, 0);
+        if shift {
+            if let Some(shift_code) = keymap::vk_to_evdev(0xA0) {
+                let _ = platform::uinput::emit_key(shift_code, 0);
+            }
         }
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-fn type_string(_text: &str) {}
-
-#[cfg(target_os = "windows")]
 fn move_mouse(dx: i32, dy: i32) {
-    let input = INPUT {
-        r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 {
-            mi: MOUSEINPUT {
-                dx,
-                dy,
-                mouseData: 0,
-                dwFlags: MOUSEEVENTF_MOVE,
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    };
-    unsafe {
-        let _ = SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+    if dx != 0 {
+        let _ = platform::uinput::emit_rel(
+            evdev::RelativeAxisCode::REL_X.0,
+            dx,
+        );
+    }
+    if dy != 0 {
+        let _ = platform::uinput::emit_rel(
+            evdev::RelativeAxisCode::REL_Y.0,
+            dy,
+        );
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-fn move_mouse(_dx: i32, _dy: i32) {}
-
-#[cfg(target_os = "windows")]
 fn scroll_mouse(delta: i32, horizontal: bool) {
-    let input = INPUT {
-        r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 {
-            mi: MOUSEINPUT {
-                dx: 0,
-                dy: 0,
-                mouseData: delta as u32,
-                dwFlags: if horizontal {
-                    MOUSEEVENTF_HWHEEL
-                } else {
-                    MOUSEEVENTF_WHEEL
-                },
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
+    let notches = delta / 120;
+    if notches == 0 {
+        return;
+    }
+    let code = if horizontal {
+        evdev::RelativeAxisCode::REL_HWHEEL.0
+    } else {
+        evdev::RelativeAxisCode::REL_WHEEL.0
     };
-    unsafe {
-        let _ = SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
-    }
+    let _ = platform::uinput::emit_rel(code, notches);
 }
 
-#[cfg(not(target_os = "windows"))]
-fn scroll_mouse(_delta: i32, _horizontal: bool) {}
-
-#[cfg(target_os = "windows")]
+/// Абсолютное перемещение курсора: на X11 через warp, иначе недоступно
+/// (Wayland не даёт клиенту управлять глобальной позицией напрямую).
 fn move_mouse_absolute(x: i32, y: i32) {
-    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
-
-    unsafe {
-        let screen_width = GetSystemMetrics(SM_CXSCREEN);
-        let screen_height = GetSystemMetrics(SM_CYSCREEN);
-        let normalized_x = if screen_width > 0 {
-            (x * 65535) / screen_width
-        } else {
-            0
-        };
-        let normalized_y = if screen_height > 0 {
-            (y * 65535) / screen_height
-        } else {
-            0
-        };
-
-        let input = INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 {
-                mi: MOUSEINPUT {
-                    dx: normalized_x,
-                    dy: normalized_y,
-                    mouseData: 0,
-                    dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        };
-        let _ = SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+    if platform::x11::warp_pointer(x, y) {
+        return;
     }
+    tracing::warn!("MouseAbsolute: абсолютное позиционирование недоступно (нет X11) — пропущено");
 }
-
-#[cfg(not(target_os = "windows"))]
-fn move_mouse_absolute(_x: i32, _y: i32) {}
 
 #[cfg(test)]
 mod tests {

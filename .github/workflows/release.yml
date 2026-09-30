@@ -4,10 +4,6 @@ on:
   push:
     tags:
       - 'v*'
-    branches:
-      - main
-    paths:
-      - '.github/release-trigger'
 
 jobs:
   release:
@@ -17,26 +13,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: 'windows-latest'
+          - platform: 'ubuntu-22.04'
             args: ''
 
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Resolve release tag
-        id: release_meta
-        shell: pwsh
-        run: |
-          if ("${{ github.ref_type }}" -eq "tag") {
-            $tag = "${{ github.ref_name }}"
-          } else {
-            $package = Get-Content package.json -Raw | ConvertFrom-Json
-            $tag = "v$($package.version)"
-          }
-          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          Write-Host "Release tag: $tag"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -50,18 +33,13 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          # Those targets are only used on macos or linux platforms,
-          # but we keep stable chain configuration simple
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: './src-tauri -> target'
 
-      - name: Install system dependencies (Ubuntu only)
-        if: matrix.platform == 'ubuntu-22.04'
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
@@ -73,14 +51,12 @@ jobs:
         uses: tauri-apps/tauri-action@action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Ключи для подписи обновлений (генерируются через `tauri signer generate`)
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ steps.release_meta.outputs.tag }}
-          releaseName: 'KeyMaster Pro v__VERSION__'
-          releaseBody: 'KeyMaster Pro release v__VERSION__. See changes in CHANGELOG.md.'
+          tagName: ${{ github.ref_name }}
+          releaseName: 'KeyMaster Linux ${{ github.ref_name }}'
+          releaseBody: 'KeyMaster Linux release ${{ github.ref_name }}. AppImage для любого дистрибутива, .deb для Debian/Ubuntu.'
           releaseDraft: false
           prerelease: false
-          updaterJsonPreferNsis: true
           args: ${{ matrix.args }}

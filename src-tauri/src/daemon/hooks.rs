@@ -1,32 +1,38 @@
-use std::sync::OnceLock;
-/// Keyboard & Mouse Low-Level Hooks (SetWindowsHookEx)
-///
-/// Устанавливает WH_KEYBOARD_LL и WH_MOUSE_LL хуки.
-/// Хук-поток владеет message loop — без него Windows не вызывает callback.
-///
-/// Anti-recursion: фильтруем LLKHF_INJECTED (наши же SendInput).
-/// Каждый callback делегирует обработку в engine.
-use std::sync::atomic::{AtomicBool, Ordering};
+//! Keyboard & Mouse input capture через evdev (замена SetWindowsHookEx).
+//!
+//! Daemon захватывает физические устройства ввода (EVIOCGRAB) и читает их
+//! напрямую. Каждое событие проходит тот же конвейер, что и LL-хук Windows:
+//! capture-режим KeyPicker → emergency stop → запись макросов → движок правил.
+//! Событие, которое движок решил пропустить, воспроизводится через виртуальные
+//! uinput-устройства (см. platform::uinput). Зацикливание невозможно: мы не
+//! читаем собственные виртуальные ноды.
 
-use tracing::{error, info};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::WindowsAndMessaging::*;
+use evdev::{Device, EventType, KeyCode, RelativeAxisCode};
+use tracing::{error, info, warn};
 
 use crate::daemon::engine;
+use crate::daemon::keymap;
 use crate::daemon::state::DaemonStateRef;
+use crate::platform;
 
-/// Глобальные флаги для связи с hook callback
+/// Флаг остановки reader-потоков
+static RUNNING: AtomicBool = AtomicBool::new(true);
 static KB_HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
 static MOUSE_HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// Глобальная ссылка на состояние Daemon
 static GLOBAL_STATE: OnceLock<DaemonStateRef> = OnceLock::new();
 
-use std::sync::Mutex;
 pub static LAST_RECORDED_MOUSE_POS: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 pub static LAST_RECORDED_MOUSE_TIME: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Приблизительная позиция курсора. На X11 синхронизируется запросами,
+/// на Wayland накапливается из относительных движений.
+static CURSOR_POS: Mutex<(i32, i32)> = Mutex::new((0, 0));
 
 /// Результат установки хуков
 #[derive(Debug)]
@@ -35,41 +41,62 @@ pub struct HookHandles {
     pub mouse_thread_id: u32,
 }
 
-/// Установить keyboard и mouse hooks на отдельных потоках
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceKind {
+    Keyboard,
+    Mouse,
+}
+
+/// Установить input-захват на устройствах evdev
 pub fn install_hooks(state: DaemonStateRef) -> Result<HookHandles, String> {
     let _ = GLOBAL_STATE.set(state.clone());
-    let state_kb = state.clone();
-    let state_mouse = state;
+    RUNNING.store(true, Ordering::SeqCst);
 
-    // Keyboard hook thread
-    let _kb_handle = std::thread::Builder::new()
-        .name("km-kb-hook".to_string())
-        .spawn(move || {
-            run_keyboard_hook(state_kb);
-        })
-        .map_err(|e| format!("Не удалось создать поток kb-hook: {}", e))?;
+    platform::uinput::init()?;
+    sync_cursor_from_display();
 
-    // Mouse hook thread
-    let _mouse_handle = std::thread::Builder::new()
-        .name("km-mouse-hook".to_string())
-        .spawn(move || {
-            run_mouse_hook(state_mouse);
-        })
-        .map_err(|e| format!("Не удалось создать поток mouse-hook: {}", e))?;
+    let devices = collect_input_devices()?;
+    if devices.is_empty() {
+        return Err(
+            "Не найдено устройств ввода в /dev/input. Проверьте права: пользователь должен \
+             состоять в группе 'input' (sudo usermod -aG input $USER) и перелогиниться."
+                .to_string(),
+        );
+    }
 
-    // Ждём пока хуки установятся (с таймаутом)
+    let mut kb_count = 0usize;
+    let mut mouse_count = 0usize;
+    for (path, kind) in devices {
+        match kind {
+            DeviceKind::Keyboard => kb_count += 1,
+            DeviceKind::Mouse => mouse_count += 1,
+        }
+        let state_reader = state.clone();
+        std::thread::Builder::new()
+            .name(format!("km-evdev-{:?}-{}", kind, path.display()))
+            .spawn(move || run_reader(path, kind, state_reader))
+            .map_err(|e| format!("Не удалось создать поток reader: {}", e))?;
+    }
+    info!(
+        "evdev: захват {} клавиатурных и {} мышиных устройств",
+        kb_count, mouse_count
+    );
+
+    // Ждём пока reader'ы захватят устройства (с таймаутом)
     let timeout = std::time::Instant::now();
     loop {
-        if KB_HOOK_INSTALLED.load(Ordering::SeqCst) && MOUSE_HOOK_INSTALLED.load(Ordering::SeqCst) {
+        let kb_ok = KB_HOOK_INSTALLED.load(Ordering::SeqCst) || kb_count == 0;
+        let mouse_ok = MOUSE_HOOK_INSTALLED.load(Ordering::SeqCst) || mouse_count == 0;
+        if kb_ok && mouse_ok {
             break;
         }
         if timeout.elapsed() > std::time::Duration::from_secs(5) {
-            return Err("Таймаут установки хуков (5с)".to_string());
+            return Err("Таймаут захвата устройств ввода (5с)".to_string());
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    info!("Хуки keyboard + mouse установлены");
+    info!("Хуки keyboard + mouse установлены (evdev)");
 
     Ok(HookHandles {
         kb_thread_id: 0,
@@ -77,488 +104,584 @@ pub fn install_hooks(state: DaemonStateRef) -> Result<HookHandles, String> {
     })
 }
 
-/// Деинсталлировать все хуки (установить флаги остановки)
+/// Деинсталлировать захват (установить флаги остановки)
 pub fn uninstall_hooks() {
+    RUNNING.store(false, Ordering::SeqCst);
     KB_HOOK_INSTALLED.store(false, Ordering::SeqCst);
     MOUSE_HOOK_INSTALLED.store(false, Ordering::SeqCst);
     engine::reset_modifier_state();
     info!("Хуки деинсталлированы");
 }
 
-/// Поток keyboard hook
-fn run_keyboard_hook(_state: DaemonStateRef) {
-    let thread_id = unsafe { GetCurrentThreadId() };
-    info!("KB hook thread: {}", thread_id);
+/// Перечислить и классифицировать устройства /dev/input/event*.
+/// Touchpad'ы (ABS-мыши) намеренно не захватываются: их события требуют
+/// пересылки ABS-осей, а ремап кнопок тачпада — не MVP-функция.
+fn collect_input_devices() -> Result<Vec<(PathBuf, DeviceKind)>, String> {
+    let mut result = Vec::new();
+    let entries = std::fs::read_dir("/dev/input")
+        .map_err(|e| format!("Не удалось прочитать /dev/input: {}. Есть ли права (группа input)?", e))?;
 
-    // Устанавливаем WH_KEYBOARD_LL
-    let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_callback), None, 0) };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if !name.starts_with("event") {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(device) = Device::open(&path) else {
+            warn!("evdev: не удалось открыть {} (нет прав?)", path.display());
+            continue;
+        };
+        let dev_name = device.name().unwrap_or("").to_string();
+        if dev_name.contains("KeyMaster Virtual") {
+            continue;
+        }
 
-    match hook {
-        Ok(h) => {
+        let keys = device.supported_keys();
+        let rel = device.supported_relative_axes();
+        let has_rel = rel
+            .map(|r| r.contains(RelativeAxisCode::REL_X) || r.contains(RelativeAxisCode::REL_Y))
+            .unwrap_or(false);
+        let has_mouse_buttons = keys
+            .map(|k| k.contains(KeyCode::BTN_LEFT) || k.contains(KeyCode::BTN_RIGHT))
+            .unwrap_or(false);
+        let has_typing_keys = keys
+            .map(|k| {
+                k.contains(KeyCode::KEY_Q)
+                    || k.contains(KeyCode::KEY_P)
+                    || k.contains(KeyCode::KEY_SPACE)
+                    || k.contains(KeyCode::KEY_KP1)
+                    || k.contains(KeyCode::KEY_VOLUMEUP)
+                    || k.contains(KeyCode::KEY_PLAYPAUSE)
+            })
+            .unwrap_or(false);
+
+        if has_rel && has_mouse_buttons {
+            result.push((path, DeviceKind::Mouse));
+        } else if has_typing_keys {
+            result.push((path, DeviceKind::Keyboard));
+        }
+    }
+    Ok(result)
+}
+
+fn run_reader(path: PathBuf, kind: DeviceKind, state: DaemonStateRef) {
+    let mut device = match Device::open(&path) {
+        Ok(device) => device,
+        Err(e) => {
+            error!("evdev: не удалось открыть {}: {}", path.display(), e);
+            return;
+        }
+    };
+    if let Err(e) = device.grab() {
+        error!("evdev: не удалось захватить {}: {}. Другой демон (kanata/ydotool) уже держит устройство?", path.display(), e);
+        return;
+    }
+
+    match kind {
+        DeviceKind::Keyboard => {
             KB_HOOK_INSTALLED.store(true, Ordering::SeqCst);
-            info!("WH_KEYBOARD_LL установлен");
-
-            // Message loop — необходим для работы hook callback
-            run_message_loop("kb");
-
-            // Снимаем хук при выходе
-            unsafe {
-                let _ = UnhookWindowsHookEx(h);
-            }
-            info!("WH_KEYBOARD_LL снят");
+            info!("evdev: клавиатура захвачена: {}", path.display());
         }
-        Err(e) => {
-            error!("Ошибка установки WH_KEYBOARD_LL: {}", e);
-        }
-    }
-}
-
-/// Поток mouse hook
-fn run_mouse_hook(_state: DaemonStateRef) {
-    let thread_id = unsafe { GetCurrentThreadId() };
-    info!("Mouse hook thread: {}", thread_id);
-
-    let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_callback), None, 0) };
-
-    match hook {
-        Ok(h) => {
+        DeviceKind::Mouse => {
             MOUSE_HOOK_INSTALLED.store(true, Ordering::SeqCst);
-            info!("WH_MOUSE_LL установлен");
+            info!("evdev: мышь захвачена: {}", path.display());
+        }
+    }
 
-            run_message_loop("mouse");
-
-            unsafe {
-                let _ = UnhookWindowsHookEx(h);
+    while RUNNING.load(Ordering::SeqCst) {
+        match device.fetch_events() {
+            Ok(events) => {
+                for event in events {
+                    match kind {
+                        DeviceKind::Keyboard => handle_event_keyboard(event, &state),
+                        DeviceKind::Mouse => handle_event_mouse(event, &state),
+                    }
+                }
             }
-            info!("WH_MOUSE_LL снят");
+            Err(e) => {
+                if RUNNING.load(Ordering::SeqCst) {
+                    error!("evdev: ошибка чтения {}: {}", path.display(), e);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
         }
-        Err(e) => {
-            error!("Ошибка установки WH_MOUSE_LL: {}", e);
+    }
+
+    let _ = device.ungrab();
+    info!("evdev: устройство отпущено: {}", path.display());
+}
+
+fn forward_keyboard(event: evdev::InputEvent) {
+    let _ = platform::uinput::emit_key(event.code(), event.value());
+}
+
+
+fn sync_cursor_from_display() {
+    if let Some((x, y)) = platform::x11::cursor_position() {
+        if let Ok(mut pos) = CURSOR_POS.lock() {
+            *pos = (x, y);
         }
     }
 }
 
-/// Простой message loop для hook thread
-fn run_message_loop(name: &str) {
-    let mut msg = MSG::default();
-    while KB_HOOK_INSTALLED.load(Ordering::SeqCst) || MOUSE_HOOK_INSTALLED.load(Ordering::SeqCst) {
-        unsafe {
-            let _ = PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+fn cursor() -> (i32, i32) {
+    match CURSOR_POS.lock() {
+        Ok(guard) => *guard,
+        Err(poisoned) => *poisoned.into_inner(),
     }
-    info!("{} message loop завершён", name);
 }
 
-/// Keyboard Low-Level Hook callback
-extern "system" fn keyboard_hook_callback(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code < 0 {
-        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+fn set_cursor(x: i32, y: i32) {
+    if let Ok(mut pos) = CURSOR_POS.lock() {
+        *pos = (x, y);
+    }
+}
+
+/// Обработка события клавиатурного устройства (аналог keyboard_hook_callback).
+fn handle_event_keyboard(event: evdev::InputEvent, state_ref: &DaemonStateRef) {
+    if event.event_type() != EventType::KEY {
+        return; // LED/MSC от физических устройств не пересылаем
     }
 
-    let kb_struct = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-    let flags = kb_struct.flags;
+    let code = event.code();
+    let value = event.value();
 
-    // Anti-recursion: пропускаем наши же инъекции
-    if (flags.0 & LLKHF_INJECTED.0) != 0 {
-        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    // Мышинные кнопки на совмещённом устройстве идут по мышиный конвейер
+    if (0x110..=0x117).contains(&code) {
+        handle_mouse_button(code, value, state_ref);
+        return;
     }
 
-    let vk_code = kb_struct.vkCode as u8;
-    let scan_code = kb_struct.scanCode as u16;
-    let is_key_down = wparam.0 == WM_KEYDOWN as usize || wparam.0 == WM_SYSKEYDOWN as usize;
+    let Some(vk_code) = keymap::evdev_to_vk(code) else {
+        // Неизвестная клавиша — просто пропускаем дальше
+        forward_keyboard(event);
+        return;
+    };
+
+    // Windows LL-хук получает автоповторы как WM_KEYDOWN — value=2 трактуем так же
+    let is_key_down = value != 0;
+    let scan_code = code;
     let event_modifiers = engine::update_modifier_state(vk_code, is_key_down);
 
     tracing::debug!(
-        "Keyboard hook: vkCode={}, scanCode={}, is_key_down={}",
+        "evdev kb: code={}, vk={:#x}, value={}, mods={:#x}",
+        code,
         vk_code,
-        scan_code,
-        is_key_down
+        value,
+        event_modifiers
     );
 
-    let state_ref = GLOBAL_STATE.get();
+    let s = match state_ref.read() {
+        Ok(s) => s,
+        Err(_) => {
+            forward_keyboard(event);
+            return;
+        }
+    };
 
-    if let Some(s_ref) = state_ref {
-        if let Ok(s) = s_ref.read() {
-            // Daemon-side chord capture. We block keyboard events while listening
-            // so Win/Alt combinations can be recorded without launching Windows UI or
-            // switching apps before KeyPicker receives the chord.
-            if s.key_capture_active.load(Ordering::Relaxed) {
-                if is_key_down && !engine::is_modifier_vk(vk_code) {
-                    let captured = if vk_code == 0x1B {
-                        crate::schemas::frontend::KeyChord::single(0)
-                    } else {
-                        crate::schemas::frontend::KeyChord {
-                            code: vk_code,
-                            modifiers: event_modifiers,
-                        }
-                    };
-                    if let Ok(mut slot) = s.last_captured_key.lock() {
-                        *slot = Some(captured);
-                    }
+    // Режим захвата клавиши для KeyPicker: собираем chord сами и блокируем
+    // событие, чтобы Win/Alt-комбинации не вызывали системных действий.
+    if s.key_capture_active.load(Ordering::Relaxed) {
+        if is_key_down && !engine::is_modifier_vk(vk_code) {
+            let captured = if vk_code == 0x1B {
+                crate::schemas::frontend::KeyChord::single(0)
+            } else {
+                crate::schemas::frontend::KeyChord {
+                    code: vk_code,
+                    modifiers: event_modifiers,
                 }
-                return LRESULT(1);
+            };
+            if let Ok(mut slot) = s.last_captured_key.lock() {
+                *slot = Some(captured);
             }
+        }
+        return; // Блокируем (не пересылаем)
+    }
 
-            // Emergency stop is handled before recording/rule dispatch. It is a
-            // constant-time atomic/mutex signal into macro-player; no macro work
-            // happens inside the LL hook callback. 0 disables the hotkey.
-            if is_key_down && s.macro_emergency_stop_vk != 0 && vk_code == s.macro_emergency_stop_vk
-            {
-                if let Some(simulator) = &s.simulator {
-                    simulator.cancel_all_macros();
-                }
-                tracing::warn!("Macro emergency stop triggered (VK={})", vk_code);
-                return LRESULT(1);
-            }
+    // Emergency stop макросов — до записи/диспетчеризации правил
+    if is_key_down && s.macro_emergency_stop_vk != 0 && vk_code == s.macro_emergency_stop_vk {
+        if let Some(simulator) = &s.simulator {
+            simulator.cancel_all_macros();
+        }
+        tracing::warn!("Macro emergency stop triggered (VK={})", vk_code);
+        return;
+    }
 
-            // Перехват F12 для запуска / остановки записи макроса
-            if vk_code == 0x7B {
-                // F12
-                if is_key_down {
-                    if s.is_recording.load(Ordering::Relaxed) {
-                        s.is_recording.store(false, Ordering::Relaxed);
-                        crate::gui::events::broadcast_event(
-                            crate::gui::events::DaemonEvent::MacroRecordingStopped {
-                                macro_id: "".to_string(),
-                            },
-                        );
-                        tracing::info!("Запись макроса остановлена по нажатию F12");
-                    } else if s.record_ready.load(Ordering::Relaxed) {
-                        s.is_recording.store(true, Ordering::Relaxed);
-                        if let Ok(mut last_time) = s.last_record_time.lock() {
-                            *last_time = None;
-                        }
-                        if let Ok(mut last_pos) = LAST_RECORDED_MOUSE_POS.lock() {
-                            *last_pos = None;
-                        }
-                        if let Ok(mut last_mouse_time) = LAST_RECORDED_MOUSE_TIME.lock() {
-                            *last_mouse_time = None;
-                        }
-                        tracing::info!("Запись макроса запущена по нажатию F12");
-                    }
-                }
-                return LRESULT(1); // Блокируем F12 для системы
-            }
-
+    // F12 — запуск/остановка записи макроса
+    if vk_code == 0x7B {
+        if is_key_down {
             if s.is_recording.load(Ordering::Relaxed) {
-                if let Ok(mut last_time_lock) = s.last_record_time.lock() {
-                    let now = std::time::Instant::now();
-                    let delay_ms = match *last_time_lock {
-                        Some(last) => now.duration_since(last).as_millis() as u32,
-                        None => 0,
-                    };
-                    *last_time_lock = Some(now);
-
-                    let action = if is_key_down {
-                        crate::schemas::frontend::MacroAction::KeyDown { code: vk_code }
-                    } else {
-                        crate::schemas::frontend::MacroAction::KeyUp { code: vk_code }
-                    };
-
-                    let step = crate::schemas::frontend::MacroStep { action, delay_ms };
-                    if let Ok(mut steps) = s.recorded_steps.lock() {
-                        steps.push(step.clone());
-                    }
-                    if let Ok(step_json) = serde_json::to_value(&step) {
-                        crate::gui::events::broadcast_event(
-                            crate::gui::events::DaemonEvent::MacroRecordingStep { step: step_json },
-                        );
-                    }
+                s.is_recording.store(false, Ordering::Relaxed);
+                crate::gui::events::broadcast_event(
+                    crate::gui::events::DaemonEvent::MacroRecordingStopped {
+                        macro_id: "".to_string(),
+                    },
+                );
+                tracing::info!("Запись макроса остановлена по нажатию F12");
+            } else if s.record_ready.load(Ordering::Relaxed) {
+                s.is_recording.store(true, Ordering::Relaxed);
+                if let Ok(mut last_time) = s.last_record_time.lock() {
+                    *last_time = None;
                 }
+                if let Ok(mut last_pos) = LAST_RECORDED_MOUSE_POS.lock() {
+                    *last_pos = None;
+                }
+                if let Ok(mut last_mouse_time) = LAST_RECORDED_MOUSE_TIME.lock() {
+                    *last_mouse_time = None;
+                }
+                tracing::info!("Запись макроса запущена по нажатию F12");
+            }
+        }
+        return; // F12 не уходит в систему
+    }
+
+    // Запись макроса: клавиатурные шаги
+    if s.is_recording.load(Ordering::Relaxed) {
+        if let Ok(mut last_time_lock) = s.last_record_time.lock() {
+            let now = std::time::Instant::now();
+            let delay_ms = match *last_time_lock {
+                Some(last) => now.duration_since(last).as_millis() as u32,
+                None => 0,
+            };
+            *last_time_lock = Some(now);
+
+            let action = if is_key_down {
+                crate::schemas::frontend::MacroAction::KeyDown { code: vk_code }
+            } else {
+                crate::schemas::frontend::MacroAction::KeyUp { code: vk_code }
+            };
+
+            let step = crate::schemas::frontend::MacroStep { action, delay_ms };
+            if let Ok(mut steps) = s.recorded_steps.lock() {
+                steps.push(step.clone());
+            }
+            if let Ok(step_json) = serde_json::to_value(&step) {
+                crate::gui::events::broadcast_event(
+                    crate::gui::events::DaemonEvent::MacroRecordingStep { step: step_json },
+                );
             }
         }
     }
 
-    let _start = std::time::Instant::now();
+    drop(s);
+
     let start = std::time::Instant::now();
     let action = engine::process_keyboard_event(
         vk_code,
         scan_code,
         is_key_down,
-        flags.0,
+        0,
         event_modifiers,
-        state_ref,
+        Some(state_ref),
     );
 
     let elapsed = start.elapsed().as_micros() as u64;
-    if let Some(s_ref) = state_ref {
-        if let Ok(s) = s_ref.read() {
-            s.last_latency_us.store(elapsed, Ordering::Relaxed);
-            if is_key_down {
-                s.keystrokes_processed.fetch_add(1, Ordering::Relaxed);
-            }
+    if let Ok(s) = state_ref.read() {
+        s.last_latency_us.store(elapsed, Ordering::Relaxed);
+        if is_key_down {
+            s.keystrokes_processed.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    match action {
-        engine::EventAction::PassThrough => unsafe { CallNextHookEx(None, code, wparam, lparam) },
-        engine::EventAction::Block => LRESULT(1),
+    if matches!(action, engine::EventAction::PassThrough) {
+        forward_keyboard(event);
     }
 }
 
-/// Mouse Low-Level Hook callback
-extern "system" fn mouse_hook_callback(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code < 0 {
-        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
-    }
-
-    let ms_struct = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-    let flags = ms_struct.flags;
-
-    // Anti-recursion
-    if (flags & LLMHF_INJECTED) != 0 {
-        return unsafe { CallNextHookEx(None, code, wparam, lparam) };
-    }
-
-    let msg_type = wparam.0 as u32;
-
-    // Определяем кнопку
-    // 1=Left, 2=Right, 3=Middle, 4=X1, 5=X2
-    let button = match msg_type {
-        wm if wm == WM_LBUTTONDOWN as u32 || wm == WM_LBUTTONUP as u32 => 1u8,
-        wm if wm == WM_RBUTTONDOWN as u32 || wm == WM_RBUTTONUP as u32 => 2u8,
-        wm if wm == WM_MBUTTONDOWN as u32 || wm == WM_MBUTTONUP as u32 => 3u8,
-        wm if wm == WM_XBUTTONDOWN as u32 || wm == WM_XBUTTONUP as u32 => {
-            let xbutton = ((ms_struct.mouseData >> 16) & 0xFFFF) as u8;
-            if xbutton == 1 { 4 } else { 5 }
-        }
-        _ => 255u8, // Движение или скролл
+/// Кнопки мыши (BTN_*) — общий путь для мышиных и совмещённых устройств.
+fn handle_mouse_button(code: u16, value: i32, state_ref: &DaemonStateRef) {
+    let Some(button) = keymap::evdev_button_to_button(code) else {
+        // Неизвестная кнопка — пропускаем
+        let _ = platform::uinput::emit_mouse_button(code, value);
+        return;
     };
+    let is_mouse_down = value == 1;
 
-    let x = ms_struct.pt.x;
-    let y = ms_struct.pt.y;
-    let delta = if msg_type == WM_MOUSEWHEEL as u32 || msg_type == WM_MOUSEHWHEEL as u32 {
-        ((ms_struct.mouseData >> 16) & 0xFFFF) as i16 as i32
-    } else {
-        0
-    };
+    // Трекинг нажатых кнопок (для drag-детекции при записи макросов)
+    update_button_state(button, is_mouse_down);
 
-    let is_mouse_down = msg_type == WM_LBUTTONDOWN as u32
-        || msg_type == WM_RBUTTONDOWN as u32
-        || msg_type == WM_MBUTTONDOWN as u32
-        || msg_type == WM_XBUTTONDOWN as u32;
+    // На реальном клике синхронизируем позицию с X11 (на Wayland остаётся накопленной)
+    sync_cursor_from_display();
+    let (x, y) = cursor();
 
-    // Логируем только значимые события мыши (клики/скролл),
-    // но НЕ каждый WM_MOUSEMOVE — иначе лог раздувается до сотен МБ.
-    if button != 255 || is_mouse_down || delta != 0 {
-        tracing::debug!(
-            "Хук мыши: msg_type={}, button={}, x={}, y={}, delta={}, is_mouse_down={}",
-            msg_type,
-            button,
-            x,
-            y,
-            delta,
-            is_mouse_down
-        );
-    }
-
-    let state_ref = GLOBAL_STATE.get();
-
-    if let Some(s_ref) = state_ref {
-        if let Ok(s) = s_ref.read() {
-            // Режим захвата кнопки мыши для KeyPicker: сохраняем код кнопки 1-5
-            // при mouse down (поллинг keycapture.get_captured_mouse заберёт его),
-            // затем пропускаем событие мимо engine, чтобы GUI мог записать клик
-            // даже если правило его блокирует.
-            // Решает проблему X1/X2: WebView2 не передаёт их в JS как mousedown.
-            if s.key_capture_active.load(Ordering::Relaxed) {
-                if is_mouse_down && button != 255 {
-                    if let Ok(mut captured) = s.last_captured_mouse.lock() {
-                        *captured = Some(button);
-                        tracing::debug!("Захвачена кнопка мыши для KeyPicker: {}", button);
-                    }
-                }
-                return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+    let record_kind = {
+        let s = match state_ref.read() {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = platform::uinput::emit_mouse_button(code, value);
+                return;
             }
+        };
 
-            if s.is_recording.load(Ordering::Relaxed) {
-                let now = std::time::Instant::now();
-                let mut steps_to_record = Vec::new();
-
-                // Получим задержку для первого шага на этом событии
-                let mut current_delay = 0u32;
-                if let Ok(last_time) = s.last_record_time.lock() {
-                    current_delay = match *last_time {
-                        Some(last) => now.duration_since(last).as_millis() as u32,
-                        None => 0,
-                    };
-                }
-
-                // 1. Проверяем, нужно ли вставить координаты перед кликом/скроллом
-                if button != 255 || delta != 0 {
-                    let mut need_force_mouse_pos = false;
-                    if let Ok(mut last_pos_guard) = LAST_RECORDED_MOUSE_POS.lock() {
-                        match *last_pos_guard {
-                            Some((lx, ly)) => {
-                                if lx != x || ly != y {
-                                    *last_pos_guard = Some((x, y));
-                                    need_force_mouse_pos = true;
-                                }
-                            }
-                            None => {
-                                *last_pos_guard = Some((x, y));
-                                need_force_mouse_pos = true;
-                            }
-                        }
-                    }
-                    if need_force_mouse_pos {
-                        if let Ok(mut last_mouse_time) = LAST_RECORDED_MOUSE_TIME.lock() {
-                            *last_mouse_time = Some(now);
-                        }
-                        steps_to_record.push(crate::schemas::frontend::MacroStep {
-                            action: crate::schemas::frontend::MacroAction::MouseToAbsolute { x, y },
-                            delay_ms: current_delay,
-                        });
-                        // Для последующего действия в этом же событии задержка будет 0
-                        current_delay = 0;
-                    }
-                }
-
-                // 2. Обрабатываем текущее действие
-                let mut action_to_record = None;
-                if button != 255 {
-                    let action = if is_mouse_down {
-                        crate::schemas::frontend::MacroAction::MouseDown { code: button }
-                    } else {
-                        crate::schemas::frontend::MacroAction::MouseUp { code: button }
-                    };
-                    action_to_record = Some(action);
-                } else if delta != 0 {
-                    action_to_record = Some(if msg_type == WM_MOUSEHWHEEL as u32 {
-                        crate::schemas::frontend::MacroAction::MouseHScroll { delta }
-                    } else {
-                        crate::schemas::frontend::MacroAction::MouseScroll { delta }
-                    });
-                } else if msg_type == WM_MOUSEMOVE as u32 {
-                    let record_mouse_moves = s.record_mouse_moves.load(Ordering::Relaxed);
-                    let record_mouse_drag_drop_only =
-                        s.record_mouse_drag_drop_only.load(Ordering::Relaxed);
-
-                    let mut should_record = false;
-
-                    if record_mouse_moves {
-                        let is_drag = if record_mouse_drag_drop_only {
-                            let is_left_down = (unsafe {
-                                windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x01)
-                            } as u16
-                                & 0x8000)
-                                != 0;
-                            let is_right_down = (unsafe {
-                                windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x02)
-                            } as u16
-                                & 0x8000)
-                                != 0;
-                            let is_middle_down = (unsafe {
-                                windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x04)
-                            } as u16
-                                & 0x8000)
-                                != 0;
-                            is_left_down || is_right_down || is_middle_down
-                        } else {
-                            true
-                        };
-
-                        if is_drag {
-                            if let Ok(mut last_pos_guard) = LAST_RECORDED_MOUSE_POS.lock() {
-                                match *last_pos_guard {
-                                    Some((lx, ly)) => {
-                                        // Порог 15 пикселей для сглаживания мелких движений
-                                        if (x - lx).abs() > 15 || (y - ly).abs() > 15 {
-                                            // Троттлинг 100 мс для предотвращения генерации сотен шагов
-                                            if let Ok(last_time_guard) =
-                                                LAST_RECORDED_MOUSE_TIME.lock()
-                                            {
-                                                match *last_time_guard {
-                                                    Some(last_t) => {
-                                                        if now.duration_since(last_t).as_millis()
-                                                            >= 100
-                                                        {
-                                                            should_record = true;
-                                                        }
-                                                    }
-                                                    None => {
-                                                        should_record = true;
-                                                    }
-                                                }
-                                            }
-                                            if should_record {
-                                                *last_pos_guard = Some((x, y));
-                                            }
-                                        }
-                                    }
-                                    None => {
-                                        *last_pos_guard = Some((x, y));
-                                        should_record = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if should_record {
-                        if let Ok(mut last_mouse_time) = LAST_RECORDED_MOUSE_TIME.lock() {
-                            *last_mouse_time = Some(now);
-                        }
-                        action_to_record =
-                            Some(crate::schemas::frontend::MacroAction::MouseToAbsolute { x, y });
-                    }
-                }
-
-                if let Some(action) = action_to_record {
-                    steps_to_record.push(crate::schemas::frontend::MacroStep {
-                        action,
-                        delay_ms: current_delay,
-                    });
-                }
-
-                // 3. Сохраняем шаги и обновляем глобальное время записи
-                if !steps_to_record.is_empty() {
-                    if let Ok(mut last_time_lock) = s.last_record_time.lock() {
-                        *last_time_lock = Some(now);
-                    }
-
-                    if let Ok(mut steps) = s.recorded_steps.lock() {
-                        for step in &steps_to_record {
-                            steps.push(step.clone());
-                        }
-                    }
-                    for step in steps_to_record {
-                        if let Ok(step_json) = serde_json::to_value(&step) {
-                            crate::gui::events::broadcast_event(
-                                crate::gui::events::DaemonEvent::MacroRecordingStep {
-                                    step: step_json,
-                                },
-                            );
-                        }
-                    }
+        // Захват кнопки для KeyPicker: запоминаем код кнопки 1-5 при mouse down
+        if s.key_capture_active.load(Ordering::Relaxed) {
+            if is_mouse_down {
+                if let Ok(mut captured) = s.last_captured_mouse.lock() {
+                    *captured = Some(button);
+                    tracing::debug!("Захвачена кнопка мыши для KeyPicker: {}", button);
                 }
             }
+            None
+        } else if s.is_recording.load(Ordering::Relaxed) {
+            // Запись макроса: клики
+            Some(RecordKind::Button {
+                button,
+                down: is_mouse_down,
+            })
+        } else {
+            None
         }
+        // guard здесь освобождается перед вызовом движка
+    };
+
+    if let Some(kind) = record_kind {
+        record_mouse_step(state_ref, kind, x, y);
     }
 
     let start = std::time::Instant::now();
     let action = engine::process_mouse_event(
-        button,
-        x,
-        y,
-        delta,
-        msg_type == WM_MOUSEHWHEEL as u32,
-        msg_type == WM_MOUSEMOVE as u32,
-        flags,
-        is_mouse_down,
-        state_ref,
+        button, x, y, 0, false, false, 0, is_mouse_down, Some(state_ref),
+    );
+    let elapsed = start.elapsed().as_micros() as u64;
+    if let Ok(s) = state_ref.read() {
+        s.last_latency_us.store(elapsed, Ordering::Relaxed);
+    }
+
+    if matches!(action, engine::EventAction::PassThrough) {
+        let _ = platform::uinput::emit_mouse_button(code, value);
+    }
+}
+
+/// Битовая маска нажатых физических кнопок (1..=5 → биты 0..=4).
+static BUTTONS_DOWN: AtomicU32 = AtomicU32::new(0);
+
+fn update_button_state(button: u8, down: bool) {
+    if !(1..=5).contains(&button) {
+        return;
+    }
+    let mask = 1u32 << (button - 1);
+    if down {
+        BUTTONS_DOWN.fetch_or(mask, Ordering::Relaxed);
+    } else {
+        BUTTONS_DOWN.fetch_and(!mask, Ordering::Relaxed);
+    }
+}
+
+fn any_button_down() -> bool {
+    BUTTONS_DOWN.load(Ordering::Relaxed) != 0
+}
+
+/// Относительные движения и скролл мыши (REL_*).
+fn handle_event_mouse(event: evdev::InputEvent, state_ref: &DaemonStateRef) {
+    if event.event_type() != EventType::RELATIVE {
+        // ABS/прочее от мышиных устройств не пересылаем (не заявлено в виртуальном устройстве)
+        return;
+    }
+
+    let code = event.code();
+    let value = event.value();
+
+    let is_wheel = code == RelativeAxisCode::REL_WHEEL.0;
+    let is_hwheel = code == RelativeAxisCode::REL_HWHEEL.0;
+    let is_move = code == RelativeAxisCode::REL_X.0 || code == RelativeAxisCode::REL_Y.0;
+
+    let (x, y, delta, record_kind) = if is_wheel || is_hwheel {
+        sync_cursor_from_display();
+        let (x, y) = cursor();
+        let delta = value * 120; // Windows-совместимый wheel delta (120 на щелчок)
+        let record_kind = match state_ref.read() {
+            Ok(s) => {
+                if s.is_recording.load(Ordering::Relaxed) {
+                    Some(RecordKind::Scroll { delta, horizontal: is_hwheel })
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        };
+        (x, y, delta, record_kind)
+    } else if is_move {
+        let (old_x, old_y) = cursor();
+        let (nx, ny) = if code == RelativeAxisCode::REL_X.0 {
+            (old_x + value, old_y)
+        } else {
+            (old_x, old_y + value)
+        };
+        set_cursor(nx, ny);
+
+        // Запись движений мыши при записи макроса (порог 15px, троттлинг 100мс)
+        let record_kind = match state_ref.read() {
+            Ok(s) => {
+                if s.is_recording.load(Ordering::Relaxed)
+                    && s.record_mouse_moves.load(Ordering::Relaxed)
+                {
+                    let is_drag = if s.record_mouse_drag_drop_only.load(Ordering::Relaxed) {
+                        any_button_down()
+                    } else {
+                        true
+                    };
+                    if is_drag && moved_far_enough(nx, ny) {
+                        Some(RecordKind::Move { x: nx, y: ny })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        };
+        (nx, ny, 0, record_kind)
+    } else {
+        // REL_MISC и прочее — пропускаем дальше без обработки движком
+        let _ = platform::uinput::emit_rel(code, value);
+        return;
+    };
+
+    if let Some(kind) = record_kind {
+        record_mouse_step(state_ref, kind, x, y);
+    }
+
+    let action = engine::process_mouse_event(
+        255, x, y, delta, is_hwheel, is_move, 0, false, Some(state_ref),
     );
 
-    let elapsed = start.elapsed().as_micros() as u64;
-    if let Some(s_ref) = state_ref {
-        if let Ok(s) = s_ref.read() {
-            s.last_latency_us.store(elapsed, Ordering::Relaxed);
+    if matches!(action, engine::EventAction::PassThrough) {
+        let _ = platform::uinput::emit_rel(code, value);
+    }
+}
+
+/// Порог 15 пикселей для сглаживания мелких движений при записи.
+fn moved_far_enough(x: i32, y: i32) -> bool {
+    let mut should = false;
+    if let Ok(last_pos_guard) = LAST_RECORDED_MOUSE_POS.lock() {
+        match *last_pos_guard {
+            Some((lx, ly)) => {
+                if (x - lx).abs() > 15 || (y - ly).abs() > 15 {
+                    should = true;
+                }
+            }
+            None => should = true,
+        }
+    }
+    should
+}
+
+enum RecordKind {
+    Button { button: u8, down: bool },
+    Scroll { delta: i32, horizontal: bool },
+    Move { x: i32, y: i32 },
+}
+
+/// Записать шаг макроса для мыши. Портировано из mouse_hook_callback
+/// Windows-версии: перед кликом/скроллом вставляется MouseToAbsolute.
+fn record_mouse_step(state_ref: &DaemonStateRef, kind: RecordKind, x: i32, y: i32) {
+    let Ok(s) = state_ref.read() else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let mut steps_to_record = Vec::new();
+
+    let mut current_delay = 0u32;
+    if let Ok(last_time) = s.last_record_time.lock() {
+        current_delay = match *last_time {
+            Some(last) => now.duration_since(last).as_millis() as u32,
+            None => 0,
+        };
+    }
+
+    // Вставляем координаты перед кликом/скроллом, если позиция изменилась
+    if !matches!(kind, RecordKind::Move { .. }) {
+        let mut need_force_mouse_pos = false;
+        if let Ok(mut last_pos_guard) = LAST_RECORDED_MOUSE_POS.lock() {
+            match *last_pos_guard {
+                Some((lx, ly)) => {
+                    if lx != x || ly != y {
+                        *last_pos_guard = Some((x, y));
+                        need_force_mouse_pos = true;
+                    }
+                }
+                None => {
+                    *last_pos_guard = Some((x, y));
+                    need_force_mouse_pos = true;
+                }
+            }
+        }
+        if need_force_mouse_pos {
+            if let Ok(mut last_mouse_time) = LAST_RECORDED_MOUSE_TIME.lock() {
+                *last_mouse_time = Some(now);
+            }
+            steps_to_record.push(crate::schemas::frontend::MacroStep {
+                action: crate::schemas::frontend::MacroAction::MouseToAbsolute { x, y },
+                delay_ms: current_delay,
+            });
+            current_delay = 0;
         }
     }
 
-    match action {
-        engine::EventAction::PassThrough => unsafe { CallNextHookEx(None, code, wparam, lparam) },
-        engine::EventAction::Block => LRESULT(1),
+    let action_to_record = match kind {
+        RecordKind::Button { button, down } => {
+            if down {
+                Some(crate::schemas::frontend::MacroAction::MouseDown { code: button })
+            } else {
+                Some(crate::schemas::frontend::MacroAction::MouseUp { code: button })
+            }
+        }
+        RecordKind::Scroll { delta, horizontal } => Some(if horizontal {
+            crate::schemas::frontend::MacroAction::MouseHScroll { delta }
+        } else {
+            crate::schemas::frontend::MacroAction::MouseScroll { delta }
+        }),
+        RecordKind::Move { x, y } => {
+            // Троттлинг 100 мс для предотвращения сотен шагов
+            let mut should_record = false;
+            if let Ok(mut last_mouse_time) = LAST_RECORDED_MOUSE_TIME.lock() {
+                match *last_mouse_time {
+                    Some(last_t) => {
+                        if now.duration_since(last_t).as_millis() >= 100 {
+                            should_record = true;
+                        }
+                    }
+                    None => should_record = true,
+                }
+                if should_record {
+                    *last_mouse_time = Some(now);
+                }
+            }
+            if should_record {
+                if let Ok(mut last_pos_guard) = LAST_RECORDED_MOUSE_POS.lock() {
+                    *last_pos_guard = Some((x, y));
+                }
+                Some(crate::schemas::frontend::MacroAction::MouseToAbsolute { x, y })
+            } else {
+                None
+            }
+        }
+    };
+
+    if let Some(action) = action_to_record {
+        steps_to_record.push(crate::schemas::frontend::MacroStep {
+            action,
+            delay_ms: current_delay,
+        });
+    }
+
+    if !steps_to_record.is_empty() {
+        if let Ok(mut last_time_lock) = s.last_record_time.lock() {
+            *last_time_lock = Some(now);
+        }
+        if let Ok(mut steps) = s.recorded_steps.lock() {
+            for step in &steps_to_record {
+                steps.push(step.clone());
+            }
+        }
+        for step in steps_to_record {
+            if let Ok(step_json) = serde_json::to_value(&step) {
+                crate::gui::events::broadcast_event(
+                    crate::gui::events::DaemonEvent::MacroRecordingStep { step: step_json },
+                );
+            }
+        }
     }
 }
